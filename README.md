@@ -71,6 +71,18 @@ The goal is to **aggregate tasks across platforms**, allowing individuals to use
 ## Setup (Planned)
 
 1. Clone the repo.
-2. Install dependencies:
+2. (Optional) Create a virtual environment and activate it.
+3. Install the package:
    ```bash
-   pip install -r requirements.txt
+   pip install -e .
+   ```
+4. Run configuration:
+   ```bash
+   asana-warrior configure
+   ```
+5. (Optional) Install Taskwarrior event hooks so changes trigger Asana sync:
+   ```bash
+   asana-warrior install-hook
+   ```
+   This drops small scripts into `~/.task/hooks/{on-add,on-modify,on-delete}.d` so that
+   after you add, modify, or delete tasks, `asana-warrior sync` will automatically run.

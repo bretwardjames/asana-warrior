@@ -1,0 +1,4 @@
+[console_scripts]
+asana-warrior = asana_warrior.cli:main
+aw = asana_warrior.cli:main
+awarrior = asana_warrior.cli:main

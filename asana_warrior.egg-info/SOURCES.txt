@@ -1,0 +1,11 @@
+README.md
+setup.py
+asana_warrior/__init__.py
+asana_warrior/cli.py
+asana_warrior/config.py
+asana_warrior.egg-info/PKG-INFO
+asana_warrior.egg-info/SOURCES.txt
+asana_warrior.egg-info/dependency_links.txt
+asana_warrior.egg-info/entry_points.txt
+asana_warrior.egg-info/requires.txt
+asana_warrior.egg-info/top_level.txt
