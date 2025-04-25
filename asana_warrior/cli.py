@@ -751,8 +751,8 @@ def install_hook():
     os.makedirs(hooks_dir, exist_ok=True)
     os.chmod(hooks_dir, 0o755)
 
-    # Hook events: run on task add, modify, delete (exit), and sync
-    events = ['add', 'modify', 'exit', 'sync']
+    # Hook event: run on task add only to avoid recursive sync loops
+    events = ['add']
 
     # Resolve executable
     exe = shutil.which('asana-warrior') or shutil.which('aw')
@@ -764,7 +764,8 @@ def install_hook():
     add_delete_script = f"""#!/usr/bin/env bash
 cd ~ || exit 0
 stdin=$(cat)
-nohup {exe} sync >> ~/.task/asana-sync.log 2>&1 < /dev/null &
+# Trigger sync in background without logging
+nohup {exe} sync > /dev/null 2>&1 &
 printf "%s\\n" "$stdin"
 exit 0
 """
@@ -777,8 +778,8 @@ cd ~ || exit 0
 read -r old_task
 read -r new_task
 
-# Run sync in background (detached)
-nohup {exe} sync >> ~/.task/asana-sync.log 2>&1 < /dev/null &
+# Trigger sync in background without logging
+nohup {exe} sync > /dev/null 2>&1 &
 
 # Output only the new task (to Taskwarrior)
 printf "%s\\n" "$new_task"
