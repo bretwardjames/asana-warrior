@@ -1,5 +1,5 @@
-click
 appdirs
+click
 requests
 requests-oauthlib
 taskw

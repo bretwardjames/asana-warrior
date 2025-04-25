@@ -1,3 +1,5 @@
+![WIP](https://img.shields.io/badge/status-WIP-yellow)
+
 # Taskwarrior ↔ Asana Sync Plugin
 
 ## Overview
