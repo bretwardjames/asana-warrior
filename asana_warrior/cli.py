@@ -275,14 +275,23 @@ def sync():
             existing = tw.filter_tasks({"asana_id": t_gid})
             if existing:
                 continue
-            # Fetch full task details
+            # Fetch full task details, including any mapped fields
+            fields = {"name", "notes", "due_on"}
+            for ak in config.get('field_mappings', {}).get('asana_to_tw', {}):
+                if ak.startswith('custom_field.'):
+                    fields.add('custom_fields')
+                else:
+                    fields.add(ak)
+            opt_fields = ",".join(sorted(fields))
             resp_t = session.get(
                 f"https://app.asana.com/api/1.0/tasks/{t_gid}",
-                params={"opt_fields": "name,notes,due_on"},
+                params={"opt_fields": opt_fields},
             )
             if resp_t.status_code != 200:
                 click.echo(f"  Failed to fetch task {t_gid}: {resp_t.status_code}")
                 continue
+            print('RESPONSE')
+            print(resp_t.text)
             td = resp_t.json().get("data", {})
             desc = td.get("name", "")
             notes = td.get("notes", "")
@@ -291,6 +300,18 @@ def sync():
             due = td.get("due_on")
             # Build TaskWarrior add kwargs
             kwargs = {"description": desc, "project": tw_project, "asana_id": t_gid}
+            for ak, twk in config.get('field_mappings', {}).get('asana_to_tw', {}).items():
+                # support built-in and custom fields
+                if ak.startswith('custom_field.'):
+                    cf_gid = ak.split('.',1)[1]
+                    cfval = td.get('custom_fields',{}).get(cf_gid)
+                else:
+                    cfval = td.get(ak)
+                    # If Asana returns an object (e.g. assignee), extract its name
+                    if isinstance(cfval, dict) and 'name' in cfval:
+                        cfval = cfval.get('name')
+                if cfval is not None:
+                    kwargs[twk] = cfval
             if due:
                 kwargs["due"] = due
             try:
@@ -362,6 +383,14 @@ def sync():
                 dt_due = iso_to_dt(due_val)
                 if dt_due:
                     tpayload['data']['due_on'] = dt_due.date().isoformat()
+        for twk, ak in config.get('field_mappings', {}).get('tw_to_asana', {}).items():
+            if twk in task and task[twk] is not None:
+                # dotted path support for custom_field.<gid>
+                if ak.startswith('custom_field.'):
+                    _, cf_gid = ak.split('.',1)
+                    tpayload['data'].setdefault('custom_fields', {})[cf_gid] = task[twk]
+                else:
+                    tpayload['data'][ak] = task[twk]
         # Create Asana task
         try:
             tresp = session.post(
@@ -795,6 +824,130 @@ exit 0
 
         except Exception as e:
             click.echo(f"Failed to install hook for {ev}: {e}")
+
+@cli.command('map-fields')
+def map_fields():
+    """Interactively define mappings between Asana fields (built-in and custom)
+    and TaskWarrior attributes/UDAs."""
+    from taskw import TaskWarrior
+    import re
+
+    # 1) Load config & session
+    config = load_config()
+    if not config.get('auth_type'):
+        click.echo('No configuration found; run `asana-warrior configure` first.')
+        return
+
+    if config['auth_type'] == 'pat':
+        session = requests.Session()
+        session.headers.update({'Authorization': f"Bearer {config['asana_token']}"})
+    else:
+        session = OAuth2Session(
+            config['client_id'],
+            token=config['token'],
+            redirect_uri=config['redirect_uri']
+        )
+
+    # 2) Gather custom fields from all configured Asana projects
+    project_ids = config.get('projects', [])
+    if not project_ids:
+        click.echo('No Asana projects configured; run `asana-warrior configure` first.')
+        return
+
+    # Built-in Asana fields (excluding name/notes, due_on, completed)
+    asana_fields = {
+        'assignee':                  'Assignee',
+        'assignee_status':           'Assignee status',
+        'created_at':                'Created at',
+        'modified_at':               'Modified at',
+        'due_at':                    'Due time',
+        'start_on':                  'Start on',
+        'html_notes':                'HTML notes',
+        'is_rendered_as_separator':  'Separator flag',
+        'tags':                      'Tags',
+        'followers':                 'Followers',
+        'projects':                  'Projects',
+        'workspace':                 'Workspace',
+        'resource_subtype':          'Resource subtype',
+        'resource_type':             'Resource type',
+        'hearted':                   'Hearted by me',
+        'hearts':                    'Hearts count',
+        'likes':                     'Likes count',
+    }
+
+    # Merge custom fields across all configured Asana projects
+    for proj_gid in project_ids:
+        resp = session.get(
+            f"https://app.asana.com/api/1.0/projects/{proj_gid}",
+            params={'opt_fields':
+                    'custom_field_settings.custom_field.gid,custom_field_settings.custom_field.name'}
+        )
+        if resp.status_code != 200:
+            click.echo(f"Warning: failed to load custom fields for project {proj_gid}: {resp.status_code}")
+            continue
+        proj_data = resp.json().get('data', {})
+        for cs in proj_data.get('custom_field_settings', []):
+            cf = cs.get('custom_field', {})
+            cf_gid = cf.get('gid')
+            cf_name = cf.get('name')
+            if cf_gid and cf_name:
+                asana_fields[f"custom_field.{cf_gid}"] = cf_name
+
+
+    # 4) Discover TaskWarrior UDAs + built-ins
+    tw = TaskWarrior()
+    try:
+        udas = list(tw.config.get_udas().keys())
+    except Exception:
+        udas = []
+    built_in_tw = ['description', 'project', 'due', 'priority', 'tags', 'status']
+    tw_keys = built_in_tw + udas
+    click.echo("\nAvailable TaskWarrior fields/UDAs: " + ", ".join(tw_keys))
+
+    # 5) Walk the user through Asana → TW
+    cfg = config.setdefault('field_mappings', {})
+    atot = cfg.setdefault('asana_to_tw', {})
+    click.echo("\n--- Asana → TaskWarrior mappings ---")
+    create_opt = '<create new UDA>'
+    for key, label in asana_fields.items():
+        if not click.confirm(f"Map Asana field '{label}' ({key}) → TW?", default=False):
+            continue
+        # choose existing TW field/uda or create a new UDA
+        choices = tw_keys + [create_opt]
+        sel = click.prompt(
+            f"Select or create TW field for '{label}'",
+            type=click.Choice(choices)
+        )
+        if sel == create_opt:
+            base = label.lower().replace(' ', '_')
+            default_name = re.sub(r'[^a-z0-9_]', '_', base)
+            name = click.prompt("Enter new UDA name", default=default_name)
+            uda_type = click.prompt(
+                "UDA type",
+                type=click.Choice(['string', 'numeric', 'date', 'duration']),
+                default='string'
+            )
+            uda_label = click.prompt("UDA label", default=label)
+            tw = TaskWarrior()
+            tw._execute('config', f"uda.{name}.type", uda_type)
+            tw._execute('config', f"uda.{name}.label", uda_label)
+            tw_keys.append(name)
+            sel = name
+        atot[key] = sel
+
+    # 6) ...and TW → Asana
+    ttoa = cfg.setdefault('tw_to_asana', {})
+    click.echo("\n--- TaskWarrior → Asana mappings ---")
+    af_keys = list(asana_fields.keys())
+    click.echo("Available Asana fields: " + ", ".join(af_keys))
+    for twk in tw_keys:
+        if click.confirm(f"Map TW field \"{twk}\" → Asana?", default=False):
+            sel = click.prompt("Select Asana field", type=click.Choice(af_keys))
+            ttoa[twk] = sel
+
+    # 7) Save it back
+    save_config(config)
+    click.echo(f"Field mappings saved to {get_config_path()}")
 
 def main():
     cli()
