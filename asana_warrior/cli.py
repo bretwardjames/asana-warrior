@@ -424,7 +424,6 @@ def sync():
         asana_gid = task.get('asana_id')
         last_sync_ts = task.get('asana_modified_at', '')
         tw_mod_ts = task.get('modified', '')
-        click.echo(f"Task {tw_uuid} (Asana {asana_gid}): last_sync='{last_sync_ts}', tw_mod='{tw_mod_ts}'")
         # Continue merge logic
         if 'asana_id' not in task:
             continue
@@ -728,8 +727,8 @@ def sync():
 @cli.command('install-hook')
 def install_hook():
     """
-    Install Taskwarrior single-file hooks for add/modify/delete to trigger Asana sync.
-    This will create scripts under ~/.task/hooks/{on-add-asana-warrior, on-modify-asana-warrior, on-delete-asana-warrior}.
+    Install Taskwarrior single-file hooks for add and exit to trigger Asana sync.
+    This will create scripts under ~/.task/hooks/on-add-asana-warrior and ~/.task/hooks/on-exit-asana-warrior.
     """
     import stat
     from taskw import TaskWarrior
@@ -751,8 +750,8 @@ def install_hook():
     os.makedirs(hooks_dir, exist_ok=True)
     os.chmod(hooks_dir, 0o755)
 
-    # Hook event: run on task add only to avoid recursive sync loops
-    events = ['add']
+    # Hook events: run on task add and on exit to trigger Asana sync
+    events = ['add', 'exit']
 
     # Resolve executable
     exe = shutil.which('asana-warrior') or shutil.which('aw')
@@ -760,29 +759,27 @@ def install_hook():
         click.echo("WARNING: 'asana-warrior' not found in PATH; using fallback executable path.")
         exe = os.path.realpath(sys.argv[0])
 
-    # Hook logic for add/delete hooks (simple passthrough)
-    add_delete_script = f"""#!/usr/bin/env bash
+    # Hook logic for add hook (simple passthrough)
+    add_script = f"""#!/usr/bin/env bash
 cd ~ || exit 0
 stdin=$(cat)
+# Avoid recursion: skip hook if sync already running
+if [ -n "$ASANA_WARRIOR_RUNNING" ]; then printf "%s\\n" "$stdin"; exit 0; fi
+export ASANA_WARRIOR_RUNNING=1
 # Trigger sync in background without logging
 nohup {exe} sync > /dev/null 2>&1 &
 printf "%s\\n" "$stdin"
 exit 0
 """
 
-    # Hook logic for modify hook (use read -r for line-based splitting)
-    modify_script = f"""#!/usr/bin/env bash
+    # Hook logic for exit hook (no input, just trigger sync)
+    exit_script = f"""#!/usr/bin/env bash
 cd ~ || exit 0
-
-# Read two lines (old and new task JSON)
-read -r old_task
-read -r new_task
-
+# Avoid recursion: skip hook if sync already running
+if [ -n "$ASANA_WARRIOR_RUNNING" ]; then exit 0; fi
+export ASANA_WARRIOR_RUNNING=1
 # Trigger sync in background without logging
 nohup {exe} sync > /dev/null 2>&1 &
-
-# Output only the new task (to Taskwarrior)
-printf "%s\\n" "$new_task"
 exit 0
 """
 
@@ -790,7 +787,7 @@ exit 0
         hook_path = os.path.join(hooks_dir, f"on-{ev}-asana-warrior")
 
         try:
-            script_content = modify_script if ev == "modify" else add_delete_script
+            script_content = add_script if ev == 'add' else exit_script
             with open(hook_path, 'w') as f:
                 f.write(script_content)
             os.chmod(hook_path, 0o755)

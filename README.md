@@ -86,5 +86,6 @@ The goal is to **aggregate tasks across platforms**, allowing individuals to use
    ```bash
    asana-warrior install-hook
    ```
-   This drops small scripts into `~/.task/hooks/{on-add,on-modify,on-delete}.d` so that
-   after you add, modify, or delete tasks, `asana-warrior sync` will automatically run.
+   This drops small scripts into `~/.task/hooks/on-add-asana-warrior` and
+   `~/.task/hooks/on-exit-asana-warrior` so that after you add a task or exit
+   Taskwarrior, `asana-warrior sync` will automatically run.
