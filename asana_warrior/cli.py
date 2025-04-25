@@ -380,7 +380,13 @@ def sync():
         new_mod = tdata.get('modified_at', '')
         # Update TW with Asana ID and modified timestamp
         try:
-            tw.task_update({'uuid': tw_uuid, 'asana_id': new_gid, 'asana_modified_at': new_mod})
+            # Update Asana IDs in TaskWarrior without removing annotations
+            tw._execute(
+                tw_uuid,
+                'modify',
+                f'asana_id:{new_gid}',
+                f'asana_modified_at:{new_mod}'
+            )
             click.echo(f"  Exported TW {tw_uuid} to Asana {new_gid}")
         except Exception as e:
             click.echo(f"  Failed to update TW task {tw_uuid} after export: {e}")
@@ -449,8 +455,13 @@ def sync():
                     json={'data': {'completed': True}}
                 )
                 cresp.raise_for_status()
-                new_mod = cresp.json().get('data', {}).get('modified_at', '')
-                tw.task_update({'uuid': tw_uuid, 'asana_modified_at': new_mod})
+                new_mod = cresp.json().get('data', {},).get('modified_at', '')
+                # Update only the asana_modified_at UDA without touching annotations
+                tw._execute(
+                    tw_uuid,
+                    'modify',
+                    f'asana_modified_at:{new_mod}'
+                )
                 click.echo(f"  Marked Asana task {asana_gid} complete for TW {tw_uuid}")
             except Exception as e:
                 click.echo(f"  Failed to mark Asana task complete: {e}")
@@ -459,7 +470,12 @@ def sync():
             # Mark TW task done
             try:
                 tw.task_done(uuid=task.get('uuid'))
-                tw.task_update({'uuid': tw_uuid, 'asana_modified_at': adata.get('modified_at', '')})
+                # Update only the asana_modified_at UDA without removing annotations
+                tw._execute(
+                    tw_uuid,
+                    'modify',
+                    f'asana_modified_at:{adata.get("modified_at", "")}'
+                )
                 click.echo(f"  Marked TW task {tw_uuid} done from Asana {asana_gid}")
             except Exception as e:
                 click.echo(f"  Failed to mark TW task done: {e}")
@@ -507,7 +523,12 @@ def sync():
             new_mod = data.get('modified_at', '')
             # Update TW UDA
             try:
-                tw.task_update({'uuid': tw_uuid, 'asana_modified_at': new_mod})
+                # Update only the asana_modified_at UDA without affecting annotations
+                tw._execute(
+                    tw_uuid,
+                    'modify',
+                    f'asana_modified_at:{new_mod}'
+                )
                 click.echo(f"  Updated Asana task {asana_gid} from TW {tw_uuid}")
             except Exception as e:
                 click.echo(f"  Failed to update TW 'asana_modified_at' UDA for {tw_uuid}: {e}")
@@ -560,7 +581,12 @@ def sync():
                 data = resp.json().get('data', {})
                 new_mod = data.get('modified_at', '')
                 try:
-                    tw.task_update({'uuid': tw_uuid, 'asana_modified_at': new_mod})
+                    # Preserve annotations while updating asana_modified_at UDA
+                    tw._execute(
+                        tw_uuid,
+                        'modify',
+                        f'asana_modified_at:{new_mod}'
+                    )
                     click.echo(f"  Resolved conflict: TW->Asana for {tw_uuid}")
                 except Exception as e:
                     click.echo(f"  Failed to update TW 'asana_modified_at' UDA for {tw_uuid}: {e}")
@@ -664,11 +690,12 @@ def sync():
             stories = resp_st.json().get('data', []) if resp_st.status_code == 200 else []
         except Exception:
             stories = []
+        # Collect existing Asana comment texts to avoid duplicates
         existing_texts = {s['text'] for s in stories if s.get('type') == 'comment'}
         for ann in task.get('annotations', []):
             desc = ann.get('description', '').strip()
             # Skip previously imported Asana comments (marked) or empty
-            if desc.startswith('[asana:'):
+            if desc.startswith('[asana:') or not desc:
                 continue
             # Skip if this text already exists in Asana
             if desc in existing_texts:
@@ -724,7 +751,8 @@ def install_hook():
     os.makedirs(hooks_dir, exist_ok=True)
     os.chmod(hooks_dir, 0o755)
 
-    events = ['add', 'modify', 'exit']
+    # Hook events: run on task add, modify, delete (exit), and sync
+    events = ['add', 'modify', 'exit', 'sync']
 
     # Resolve executable
     exe = shutil.which('asana-warrior') or shutil.which('aw')
