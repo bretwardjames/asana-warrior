@@ -658,77 +658,62 @@ def sync():
                     click.echo(f"  Conflict resolution modify failed for TW {tw_uuid}: {e}")
     # Import Asana comments → Taskwarrior annotations
     click.echo("Importing Asana comments into Taskwarrior annotations...")
-    # Reload all Taskwarrior tasks
     tw_data_all = tw.load_tasks('all')
-    all_tw = []
-    for lst in tw_data_all.values():
-        all_tw.extend(lst)
+    all_tw = [t for lst in tw_data_all.values() for t in lst]
     for task in all_tw:
         asana_gid = task.get('asana_id')
         if not asana_gid:
             continue
-        # Gather existing annotation markers and texts to avoid duplicates
+        # Gather already-imported Asana story GIDs and local annotation texts
         imported_gids = set()
-        # When building existing_texts
         existing_texts = []
-        for annotation in task.get('annotations', []):
-            # Extract GID from marker
-            match = re.search(r'\[asana:(\d+)', annotation['description'])
-            if match:
-                imported_gids.add(match.group(1))
-
-            # Extract comment text
-            match_text = re.search(r'] (.*)', annotation['description'])
-            if match_text:
-                existing_texts.append(match_text.group(1).strip())
+        for ann in task.get('annotations', []):
+            desc = ann.get('description', '') or ''
+            m = re.search(r'\[asana:(\d+)', desc)
+            if m:
+                imported_gids.add(m.group(1))
+            else:
+                existing_texts.append(desc.strip())
         # Fetch Asana stories (comments)
         try:
             resp_st = session.get(
                 f"https://app.asana.com/api/1.0/tasks/{asana_gid}/stories",
-                params={"opt_fields": "gid,created_at,type,text,created_by.gid"}
+                params={"opt_fields": "gid,created_at,type,text"}
             )
         except Exception:
             continue
         if resp_st.status_code != 200:
             continue
         for story in resp_st.json().get('data', []):
-            # Only import actual comment stories
+            # Only import comment stories
             if story.get('type') != 'comment':
                 continue
-
             s_gid = story.get('gid')
-            # Skip comments we've already imported by GID
+            # Skip comments already imported by GID
             if s_gid in imported_gids:
                 continue
-
             text = story.get('text', '').strip()
             if not text:
                 continue
-
-            print("ASANA TEXT:")
-            print(text)
-            print("EXISTING TEXTS")
-            print(existing_texts)
-
-            # NEW: skip if this exact text is already in TW annotations
-            if any(text in existing for existing in existing_texts):
+            # Skip if this exact text already exists locally
+            if text in existing_texts:
                 continue
-
             note = f"[asana:{s_gid} @ {story.get('created_at','')}] {text}"
             try:
                 tw.task_annotate(task, note)
                 click.echo(f"  Imported comment {s_gid} into TW {task.get('uuid')}")
                 imported_gids.add(s_gid)
+                existing_texts.append(text)
             except Exception:
-                pass    
+                pass
     click.echo("Pushing new Taskwarrior annotations to Asana comments...")
     # Ensure we have latest TW tasks
     tw_data_all = tw.load_tasks('all')
-    all_tw = []
-    for lst in tw_data_all.values():
-        all_tw.extend(lst)
+    all_tw = [t for lst in tw_data_all.values() for t in lst]
 
     for task in all_tw:
+        # Identify this task's UUID for annotation commands
+        tw_uuid = task.get('uuid')
         asana_gid = task.get('asana_id')
         if not asana_gid:
             continue
