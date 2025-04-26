@@ -1,5 +1,9 @@
-click
-appdirs
-requests
-requests-oauthlib
+click~=8.1.8
+appdirs~=1.4.4
+requests~=2.32.3
+requests-oauthlib~=2.0.0
 taskw
+
+pip~=23.2.1
+setuptools~=65.5.0
+python-dateutil~=2.9.0.post0

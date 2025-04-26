@@ -1,15 +1,40 @@
-import click
-import sys
 import os
-import webbrowser
-import requests
-from requests_oauthlib import OAuth2Session
-from .config import load_config, save_config, get_config_path
+import re
 import shutil
+import sys
+import webbrowser
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-import re
+
+import click
+import requests
+from requests_oauthlib import OAuth2Session
+
+from .config import load_config, save_config, get_config_path
+
+
+# Helper to parse various ISO8601 timestamps (Asana & Taskwarrior)
+def iso_to_dt(ts):
+    if not ts or not isinstance(ts, str):
+        return None
+    # Try Python 3.7+ fromisoformat with offset
+    try:
+        if ts.endswith('Z'):
+            s = ts[:-1] + '+00:00'
+            return datetime.fromisoformat(s)
+        return datetime.fromisoformat(ts)
+    except Exception:
+        pass
+    # Fallback: Taskwarrior format YYYYMMDDTHHMMSSZ
+    try:
+        if ts.endswith('Z') and 'T' in ts and len(ts.split('T')[0]) == 8:
+            dt = datetime.strptime(ts, '%Y%m%dT%H%M%SZ')
+            return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    return None
+
 
 @click.group()
 def cli():
@@ -19,6 +44,7 @@ def cli():
 @cli.command()
 def configure():
     """Configure Asana authentication and workspace."""
+    global token, oauth
     config = load_config()
     # Load .env for default credentials
     env_vars = {}
@@ -209,9 +235,13 @@ def configure():
         ctx = click.get_current_context()
         ctx.invoke(sync)
 
+
+
+
 @cli.command()
 def sync():
     """Sync tasks from Asana into Taskwarrior."""
+    global payload
     config = load_config()
     if not config.get("auth_type"):
         click.echo("No configuration found. Please run `asana-warrior configure` first.")
@@ -234,6 +264,8 @@ def sync():
         click.echo(f"Failed to fetch user workspaces: {me_resp.status_code} {me_resp.text}")
         return
     me_data = me_resp.json().get("data", {})
+    # Current user gid for skipping self-posted comments
+    me_gid = me_data.get("gid")
     ws_list = me_data.get("workspaces", [])
     ws_name_to_gid = {w.get("name"): w.get("gid") for w in ws_list}
     ws_gid_to_name = {v: k for k, v in ws_name_to_gid.items()}
@@ -422,26 +454,7 @@ def sync():
     # Merge updates between Taskwarrior and Asana
     click.echo("Merging changes between Taskwarrior and Asana...")
     # Gather Taskwarrior tasks and UDA values
-    # Helper to parse various ISO8601 timestamps (Asana & Taskwarrior)
-    def iso_to_dt(ts):
-        if not ts or not isinstance(ts, str):
-            return None
-        # Try Python 3.7+ fromisoformat with offset
-        try:
-            if ts.endswith('Z'):
-                s = ts[:-1] + '+00:00'
-                return datetime.fromisoformat(s)
-            return datetime.fromisoformat(ts)
-        except Exception:
-            pass
-        # Fallback: Taskwarrior format YYYYMMDDTHHMMSSZ
-        try:
-            if ts.endswith('Z') and 'T' in ts and len(ts.split('T')[0]) == 8:
-                dt = datetime.strptime(ts, '%Y%m%dT%H%M%SZ')
-                return dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
-        return None
+
     # Gather Taskwarrior tasks (pending and waiting)
     tw_data = tw.load_tasks('all')
     tw_tasks = []
@@ -656,48 +669,58 @@ def sync():
             continue
         # Gather existing annotation markers and texts to avoid duplicates
         imported_gids = set()
-        existing_texts = set()
-        for ann in task.get('annotations', []):
-            desc = ann.get('description', '').strip()
-            # Extract GID if already from Asana
-            m = re.match(r'\[asana:(\d+)', desc)
-            if m:
-                imported_gids.add(m.group(1))
-                # Also grab remainder text
-                if '] ' in desc:
-                    existing_texts.add(desc.split('] ', 1)[1])
-                continue
-            # Otherwise treat whole desc as local text
-            if desc:
-                existing_texts.add(desc)
+        # When building existing_texts
+        existing_texts = []
+        for annotation in task.get('annotations', []):
+            # Extract GID from marker
+            match = re.search(r'\[asana:(\d+)', annotation['description'])
+            if match:
+                imported_gids.add(match.group(1))
+
+            # Extract comment text
+            match_text = re.search(r'] (.*)', annotation['description'])
+            if match_text:
+                existing_texts.append(match_text.group(1).strip())
         # Fetch Asana stories (comments)
         try:
             resp_st = session.get(
                 f"https://app.asana.com/api/1.0/tasks/{asana_gid}/stories",
-                params={"opt_fields": "gid,created_at,type,text"}
+                params={"opt_fields": "gid,created_at,type,text,created_by.gid"}
             )
         except Exception:
             continue
         if resp_st.status_code != 200:
             continue
         for story in resp_st.json().get('data', []):
+            # Only import actual comment stories
             if story.get('type') != 'comment':
                 continue
-            # Skip if not a comment or already imported by GID
-            if story.get('type') != 'comment':
-                continue
+
             s_gid = story.get('gid')
+            # Skip comments we've already imported by GID
             if s_gid in imported_gids:
                 continue
+
             text = story.get('text', '').strip()
             if not text:
                 continue
+
+            print("ASANA TEXT:")
+            print(text)
+            print("EXISTING TEXTS")
+            print(existing_texts)
+
+            # NEW: skip if this exact text is already in TW annotations
+            if any(text in existing for existing in existing_texts):
+                continue
+
             note = f"[asana:{s_gid} @ {story.get('created_at','')}] {text}"
             try:
                 tw.task_annotate(task, note)
-                click.echo(f"  Imported comment {story['gid']} into TW {task.get('uuid')}")
+                click.echo(f"  Imported comment {s_gid} into TW {task.get('uuid')}")
+                imported_gids.add(s_gid)
             except Exception:
-                pass
+                pass    
     click.echo("Pushing new Taskwarrior annotations to Asana comments...")
     # Ensure we have latest TW tasks
     tw_data_all = tw.load_tasks('all')
@@ -746,11 +769,16 @@ def sync():
             # Annotate TW with marker for imported Asana comment
             marker = f"[asana:{new_gid} @ {created_at}] {desc}"
             try:
+                # 1) Add the marker annotation (so we know it's been exported)
                 tw.task_annotate(task, marker)
-                click.echo(f"  Pushed annotation to Asana and marked in TW: {desc}")
+                # 2) Remove the original annotation (so it won't round‐trip)
+                orig_id = ann.get("id")
+                if orig_id:
+                    tw._execute(tw_uuid, "annotate", str(orig_id), "delete")
+                click.echo(f"  Pushed annotation to Asana and cleaned up local annotation: {desc}")
             except Exception:
                 pass
-    click.echo("Sync complete.")
+        click.echo("Sync complete.")
 
 
 @cli.command('install-hook')
@@ -759,7 +787,6 @@ def install_hook():
     Install Taskwarrior single-file hooks for add and exit to trigger Asana sync.
     This will create scripts under ~/.task/hooks/on-add-asana-warrior and ~/.task/hooks/on-exit-asana-warrior.
     """
-    import stat
     from taskw import TaskWarrior
 
     tw = TaskWarrior()
