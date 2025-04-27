@@ -12,6 +12,12 @@ import requests
 from requests_oauthlib import OAuth2Session
 
 from .config import load_config, save_config, get_config_path
+import logging
+import subprocess
+import json
+
+# Module-level logger
+logger = logging.getLogger(__name__)
 
 
 # Helper to parse various ISO8601 timestamps (Asana & Taskwarrior)
@@ -37,13 +43,33 @@ def iso_to_dt(ts):
 
 
 @click.group()
-def cli():
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.pass_context
+def cli(ctx, verbose):
     """Asana ↔ Taskwarrior sync utility."""
-    pass
+    # Check environment override for verbosity
+    envv = os.environ.get('ASANA_WARRIOR_VERBOSE', '')
+    if envv.lower() in ('1', 'true', 'yes'):
+        verbose = True
+    # Configure logging
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+    # Enable verbose HTTP logging
+    if verbose:
+        logging.getLogger('urllib3').setLevel(logging.DEBUG)
+    ctx.ensure_object(dict)
+    ctx.obj['verbose'] = verbose
 
 @cli.command()
-def configure():
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.pass_context
+def configure(ctx, verbose):
     """Configure Asana authentication and workspace."""
+    # If verbose for this command, increase logging
+    if verbose or ctx.obj.get('verbose'):
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger('urllib3').setLevel(logging.DEBUG)
+    logger.debug("configure command called")
     global token, oauth
     config = load_config()
     # Load .env for default credentials
@@ -239,8 +265,15 @@ def configure():
 
 
 @cli.command()
-def sync():
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.pass_context
+def sync(ctx, verbose):
     """Sync tasks from Asana into Taskwarrior."""
+    # If verbose from this command or global, enable detailed logging
+    if verbose or ctx.obj.get('verbose'):
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger('urllib3').setLevel(logging.DEBUG)
+    logger.debug("sync command called")
     global payload
     config = load_config()
     if not config.get("auth_type"):
@@ -322,8 +355,7 @@ def sync():
             if resp_t.status_code != 200:
                 click.echo(f"  Failed to fetch task {t_gid}: {resp_t.status_code}")
                 continue
-            print('RESPONSE')
-            print(resp_t.text)
+            logger.debug("Asana task fetch response: %s", resp_t.text)
             td = resp_t.json().get("data", {})
             desc = td.get("name", "")
             notes = td.get("notes", "")
@@ -661,6 +693,11 @@ def sync():
     tw_data_all = tw.load_tasks('all')
     all_tw = [t for lst in tw_data_all.values() for t in lst]
     for task in all_tw:
+        tw_uuid = task.get('uuid')
+        # Log full annotation dicts and descriptions
+        logger.debug("TW %s current annotations (raw): %r", tw_uuid, task.get('annotations', []))
+        logger.debug("TW %s annotation descriptions: %s", tw_uuid,
+                     [ann.get('description', '') for ann in task.get('annotations', [])])
         asana_gid = task.get('asana_id')
         if not asana_gid:
             continue
@@ -674,6 +711,8 @@ def sync():
                 imported_gids.add(m.group(1))
             else:
                 existing_texts.append(desc.strip())
+        logger.debug("TW %s imported_gids: %s", tw_uuid, imported_gids)
+        logger.debug("TW %s existing_texts: %s", tw_uuid, existing_texts)
         # Fetch Asana stories (comments)
         try:
             resp_st = session.get(
@@ -751,27 +790,53 @@ def sync():
             nd = resp_post.json().get('data', {})
             new_gid = nd.get('gid')
             created_at = nd.get('created_at')
-            # Annotate TW with marker for imported Asana comment
+            # Determine original annotation ID via TaskWarrior JSON export (disable hooks)
             marker = f"[asana:{new_gid} @ {created_at}] {desc}"
+            orig_id = None
             try:
-                # 1) Add the marker annotation (so we know it's been exported)
-                tw.task_annotate(task, marker)
-                # 2) Remove the original annotation (so it won't round‐trip)
-                orig_id = ann.get("id")
-                if orig_id:
-                    tw._execute(tw_uuid, "annotate", str(orig_id), "delete")
-                click.echo(f"  Pushed annotation to Asana and cleaned up local annotation: {desc}")
-            except Exception:
-                pass
-        click.echo("Sync complete.")
+                raw = subprocess.check_output([
+                    'task', 'rc.hooks=off', f'uuid:{tw_uuid}', 'export'
+                ])
+                data = json.loads(raw)
+                if data:
+                    for a in data[0].get('annotations', []):
+                        if a.get('description', '').strip() == desc:
+                            orig_id = a.get('id')
+                            break
+            except Exception as e:
+                logger.exception("Could not fetch annotations for TW %s: %s", tw_uuid, e)
+            # 1) Add the marker annotation
+            logger.debug("Adding marker annotation for TW %s: %s", tw_uuid, marker)
+            tw.task_annotate(task, marker)
+            # 2) Delete the original annotation by its numeric ID if found
+            if orig_id is not None:
+                try:
+                    tw._execute(tw_uuid, 'annotate', str(orig_id), 'delete')
+                    logger.debug("Deleted annotation id %s for TW %s", orig_id, tw_uuid)
+                except Exception:
+                    logger.exception("Failed to delete annotation id %s for TW %s", orig_id, tw_uuid)
+            else:
+                logger.warning(
+                    "Original annotation ID not found for description '%s' on TW %s; manual cleanup required",
+                    desc, tw_uuid
+                )
+            click.echo(f"  Pushed annotation to Asana and cleaned up local annotation: {desc}")
+    click.echo("Sync complete.")
 
 
 @cli.command('install-hook')
-def install_hook():
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.pass_context
+def install_hook(ctx, verbose):
     """
     Install Taskwarrior single-file hooks for add and exit to trigger Asana sync.
     This will create scripts under ~/.task/hooks/on-add-asana-warrior and ~/.task/hooks/on-exit-asana-warrior.
     """
+    # If verbose for this command, increase logging
+    if verbose or ctx.obj.get('verbose'):
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger('urllib3').setLevel(logging.DEBUG)
+    logger.debug("install-hook command called")
     from taskw import TaskWarrior
 
     tw = TaskWarrior()
@@ -838,9 +903,16 @@ exit 0
             click.echo(f"Failed to install hook for {ev}: {e}")
 
 @cli.command('map-fields')
-def map_fields():
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.pass_context
+def map_fields(ctx, verbose):
     """Interactively define mappings between Asana fields (built-in and custom)
     and TaskWarrior attributes/UDAs."""
+    # If verbose for this command, increase logging
+    if verbose or ctx.obj.get('verbose'):
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger('urllib3').setLevel(logging.DEBUG)
+    logger.debug("map-fields command called")
     from taskw import TaskWarrior
     import re
 
