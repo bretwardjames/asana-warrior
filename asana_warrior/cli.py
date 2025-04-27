@@ -694,10 +694,6 @@ def sync(ctx, verbose):
     all_tw = [t for lst in tw_data_all.values() for t in lst]
     for task in all_tw:
         tw_uuid = task.get('uuid')
-        # Log full annotation dicts and descriptions
-        logger.debug("TW %s current annotations (raw): %r", tw_uuid, task.get('annotations', []))
-        logger.debug("TW %s annotation descriptions: %s", tw_uuid,
-                     [ann.get('description', '') for ann in task.get('annotations', [])])
         asana_gid = task.get('asana_id')
         if not asana_gid:
             continue
@@ -706,18 +702,21 @@ def sync(ctx, verbose):
         existing_texts = []
         for ann in task.get('annotations', []):
             desc = ann.get('description', '') or ''
-            m = re.search(r'\[asana:(\d+)', desc)
+            m = re.search(r'\[[^:]+:(\d+)', desc)
             if m:
                 imported_gids.add(m.group(1))
             else:
                 existing_texts.append(desc.strip())
         logger.debug("TW %s imported_gids: %s", tw_uuid, imported_gids)
         logger.debug("TW %s existing_texts: %s", tw_uuid, existing_texts)
-        # Fetch Asana stories (comments)
+        # Fetch Asana stories (comments), including author info
         try:
             resp_st = session.get(
                 f"https://app.asana.com/api/1.0/tasks/{asana_gid}/stories",
-                params={"opt_fields": "gid,created_at,type,text"}
+                params={
+                    "opt_fields":
+                    "gid,created_at,type,text,created_by.gid,created_by.name"
+                },
             )
         except Exception:
             continue
@@ -737,10 +736,16 @@ def sync(ctx, verbose):
             # Skip if this exact text already exists locally
             if text in existing_texts:
                 continue
-            note = f"[asana:{s_gid} @ {story.get('created_at','')}] {text}"
+            # Determine author display name
+            author = story.get('created_by', {}) or {}
+            author_gid = author.get('gid')
+            author_name = author.get('name', '')
+            display_author = 'me' if author_gid == me_gid else author_name
+            created_at = story.get('created_at', '')
+            note = f"[{display_author}:{s_gid} @ {created_at}] {text}"
             try:
                 tw.task_annotate(task, note)
-                click.echo(f"  Imported comment {s_gid} into TW {task.get('uuid')}")
+                click.echo(f"  Imported comment {s_gid} by {display_author} into TW {tw_uuid}")
                 imported_gids.add(s_gid)
                 existing_texts.append(text)
             except Exception:
