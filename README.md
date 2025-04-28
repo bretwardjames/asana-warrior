@@ -89,6 +89,11 @@ The goal is to **aggregate tasks across platforms**, allowing individuals to use
    This drops small scripts into `~/.task/hooks/on-add-asana-warrior` and
    `~/.task/hooks/on-exit-asana-warrior` so that after you add a task or exit
    Taskwarrior, `asana-warrior sync` will automatically run.
+   To uninstall Taskwarrior event hooks, run:
+   ```bash
+   asana-warrior uninstall-hook
+   ```
+
 6. (Optional) Define custom field mappings:
    ```bash
    asana-warrior map-fields

@@ -694,9 +694,12 @@ def sync(ctx, verbose):
     all_tw = [t for lst in tw_data_all.values() for t in lst]
     for task in all_tw:
         tw_uuid = task.get('uuid')
+        logger.debug(f"Looking at Taskwarrior task id {tw_uuid}")
         asana_gid = task.get('asana_id')
         if not asana_gid:
+            logger.debug(f"Taskwarrior task id {tw_uuid} has no Asana id, skipping.")
             continue
+        logger.debug(f"Asana task id {asana_gid} found for Taskwarrior task {tw_uuid}, checking for new Asana comments.")
         # Gather already-imported Asana story GIDs and local annotation texts
         imported_gids = set()
         existing_texts = []
@@ -906,6 +909,43 @@ exit 0
 
         except Exception as e:
             click.echo(f"Failed to install hook for {ev}: {e}")
+
+@cli.command('uninstall-hook')
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.pass_context
+def uninstall_hook(ctx, verbose):
+    """
+    Uninstall Taskwarrior single-file hooks for add and exit to disable Asana sync.
+    This will remove scripts under ~/.task/hooks/on-add-asana-warrior and ~/.task/hooks/on-exit-asana-warrior.
+    """
+    # If verbose for this command, increase logging
+    if verbose or ctx.obj.get('verbose'):
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger('urllib3').setLevel(logging.DEBUG)
+    logger.debug("uninstall-hook command called")
+    from taskw import TaskWarrior
+
+    tw = TaskWarrior()
+
+    # Clear hooks.location config to reset to default
+    try:
+        tw._execute('config', 'hooks.location', '')
+        click.echo("Cleared Taskwarrior hooks.location; using default hooks directory")
+    except Exception as e:
+        click.echo(f"Failed to clear hooks.location: {e}")
+
+    hooks_dir = os.path.expanduser('~/.task/hooks')
+    events = ['add', 'exit']
+    for ev in events:
+        hook_path = os.path.join(hooks_dir, f"on-{ev}-asana-warrior")
+        try:
+            if os.path.exists(hook_path):
+                os.remove(hook_path)
+                click.echo(f"Removed hook for {ev} at {hook_path}")
+            else:
+                click.echo(f"No hook for {ev} found at {hook_path}")
+        except Exception as e:
+            click.echo(f"Failed to remove hook for {ev}: {e}")
 
 @cli.command('map-fields')
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
