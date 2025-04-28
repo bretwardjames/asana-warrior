@@ -16,8 +16,49 @@ import logging
 import subprocess
 import json
 
+"""Asana ↔ Taskwarrior sync utility CLI."""
 # Module-level logger
 logger = logging.getLogger(__name__)
+  
+# -- Helpers ------------------------------------------------------------------
+def _initialize(ctx, verbose_flag):
+    """Load config, set up logging, Asana session, TaskWarrior and workspace maps."""
+    # Configure logging if requested
+    if verbose_flag or ctx.obj.get('verbose'):
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger('urllib3').setLevel(logging.DEBUG)
+    # Load configuration
+    config = load_config()
+    if not config.get('auth_type'):
+        click.echo("No configuration found. Please run `asana-warrior configure` first.")
+        sys.exit(1)
+    # Setup Asana session
+    auth_type = config.get('auth_type')
+    if auth_type == 'pat':
+        token = config.get('asana_token')
+        session = requests.Session()
+        session.headers.update({'Authorization': f'Bearer {token}'})
+    else:
+        client_id = config.get('client_id')
+        client_secret = config.get('client_secret')
+        redirect_uri = config.get('redirect_uri')
+        token = config.get('token')
+        session = OAuth2Session(client_id, token=token, redirect_uri=redirect_uri)
+    # Fetch user & workspaces
+    me_resp = session.get('https://app.asana.com/api/1.0/users/me')
+    if me_resp.status_code != 200:
+        click.echo(f"Failed to fetch Asana user: {me_resp.status_code} {me_resp.text}")
+        sys.exit(1)
+    me_data = me_resp.json().get('data', {})
+    ws_list = me_data.get('workspaces', [])
+    ws_name_to_gid = {w.get('name'): w.get('gid') for w in ws_list}
+    ws_gid_to_name = {v: k for k, v in ws_name_to_gid.items()}
+    # Setup TaskWarrior interface
+    from taskw import TaskWarrior
+    tw = TaskWarrior()
+    # Configured Asana project IDs for pull
+    project_ids = config.get('projects', [])
+    return config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids
 
 
 # Helper to parse various ISO8601 timestamps (Asana & Taskwarrior)
@@ -44,6 +85,7 @@ def iso_to_dt(ts):
 
 @click.group()
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
 @click.pass_context
 def cli(ctx, verbose):
     """Asana ↔ Taskwarrior sync utility."""
@@ -261,14 +303,262 @@ def configure(ctx, verbose):
         ctx = click.get_current_context()
         ctx.invoke(sync)
 
+def sync_one(task_id):
+    """Bidirectional sync between Asana and Taskwarrior for a single task."""
+    # Perform push (TW -> Asana) for this task
+    ctx = click.get_current_context()
+    click.echo(f"Syncing TaskWarrior task {task_id} via push and pull")
+    ctx.invoke(push, task_id=task_id)
+    # Reload TaskWarrior to get updated Asana ID
+    from taskw import TaskWarrior
+    tw = TaskWarrior()
+    tw_tasks = tw.filter_tasks({'uuid': task_id})
+    if not tw_tasks:
+        click.echo(f"No TaskWarrior task with uuid {task_id} found.")
+        return
+    asana_id = tw_tasks[0].get('asana_id')
+    if not asana_id:
+        click.echo(f"Task {task_id} has no Asana ID after push; skipping pull.")
+        return
+    # Perform pull (Asana -> TW) for this Asana ID
+    ctx.invoke(pull, task_id=asana_id)
 
+@click.command()
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
+@click.pass_context()
+def push(ctx, verbose, task_id=None):
+    """Push tasks from Taskwarrior to Asana. Optional `task_id` to push one task only."""
+    # Initialize Asana session and TaskWarrior
+    config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids = _initialize(ctx, verbose)
+    # Determine tasks to export
+    if task_id:
+        tw_tasks = tw.filter_tasks({'uuid': task_id})
+        if not tw_tasks:
+            click.echo(f"No TaskWarrior task with uuid {task_id}")
+            return
+        export_tasks = tw_tasks
+    else:
+        # All tasks without an Asana ID
+        data = tw.load_tasks('all')
+        export_tasks = []
+        for lst in data.values():
+            for task in lst:
+                if not task.get('asana_id'):
+                    export_tasks.append(task)
+    click.echo("Exporting TaskWarrior tasks to Asana...")
+    # Process each task
+    for task in export_tasks:
+        tw_uuid = task.get('uuid')
+        proj_full = task.get('project', '')
+        if not proj_full or '.' not in proj_full:
+            click.echo(f"  Skipping TW {tw_uuid}: invalid project format")
+            continue
+        ws_name, proj_name = proj_full.split('.', 1)
+        ws_id = ws_name_to_gid.get(ws_name)
+        if not ws_id:
+            click.echo(f"  Unknown workspace '{ws_name}' for task {tw_uuid}")
+            continue
+        # Ensure Asana project exists
+        resp_pl = session.get(f'https://app.asana.com/api/1.0/projects?workspace={ws_id}&archived=false')
+        if resp_pl.status_code != 200:
+            click.echo(f"  Failed to list Asana projects for workspace '{ws_name}'")
+            continue
+        proj_map = {p['name']: p['gid'] for p in resp_pl.json().get('data', [])}
+        if proj_name in proj_map:
+            target_gid = proj_map[proj_name]
+        else:
+            payload = {'data': {'workspace': ws_id, 'name': proj_name}}
+            cresp = session.post('https://app.asana.com/api/1.0/projects', json=payload)
+            if cresp.status_code >= 400:
+                click.echo(f"  Failed to create Asana project '{proj_name}': {cresp.status_code}")
+                continue
+            target_gid = cresp.json().get('data', {}).get('gid')
+            click.echo(f"  Created Asana project '{proj_name}' (gid: {target_gid})")
+            config.setdefault('projects', []).append(target_gid)
+            save_config(config)
+        # Build task payload
+        desc = task.get('description', '')
+        if '\n\n' in desc:
+            name, notes = desc.split('\n\n', 1)
+        else:
+            name, notes = desc, ''
+        tpayload = {'data': {'name': name, 'notes': notes, 'projects': [target_gid]}}
+        due_val = task.get('due')
+        if due_val:
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', due_val):
+                tpayload['data']['due_on'] = due_val
+            else:
+                dt_due = iso_to_dt(due_val)
+                if dt_due:
+                    tpayload['data']['due_on'] = dt_due.date().isoformat()
+        for twk, ak in config.get('field_mappings', {}).get('tw_to_asana', {}).items():
+            if twk in task and task[twk] is not None:
+                if ak.startswith('custom_field.'):
+                    _, cf_gid = ak.split('.', 1)
+                    tpayload['data'].setdefault('custom_fields', {})[cf_gid] = task[twk]
+                else:
+                    tpayload['data'][ak] = task[twk]
+        # Create Asana task
+        try:
+            tresp = session.post('https://app.asana.com/api/1.0/tasks', json=tpayload)
+        except Exception as e:
+            click.echo(f"  Error creating Asana task for TW {tw_uuid}: {e}")
+            continue
+        if tresp.status_code >= 400:
+            click.echo(f"  Failed to create Asana task for TW {tw_uuid}: {tresp.status_code}")
+            continue
+        data = tresp.json().get('data', {})
+        new_gid = data.get('gid')
+        new_mod = data.get('modified_at', '')
+        try:
+            tw._execute(tw_uuid, 'modify', f'asana_id:{new_gid}', f'asana_modified_at:{new_mod}')
+            click.echo(f"  Exported TW {tw_uuid} to Asana {new_gid}")
+        except Exception as e:
+            click.echo(f"  Failed updating TW {tw_uuid}: {e}")
 
+@click.command()
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
+@click.pass_context()
+def pull(ctx, verbose, task_id=None):
+    """Pull tasks from Asana to Taskwarrior. Optional `task_id` to pull one task only."""
+    # Initialize Asana session and TaskWarrior
+    config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids = _initialize(ctx, verbose)
+    # Determine Asana->TW field mappings
+    base_fields = {'name', 'notes', 'due_on'}
+    for ak in config.get('field_mappings', {}).get('asana_to_tw', {}):
+        if ak.startswith('custom_field.'):
+            base_fields.add('custom_fields')
+        else:
+            base_fields.add(ak)
+    opt_fields = ','.join(sorted(base_fields))
+    # Single task pull
+    if task_id:
+        gids = [task_id]
+    else:
+        gids = project_ids
+    # If pulling a specific Asana task
+    if task_id:
+        tgid = task_id
+        resp_t = session.get(f'https://app.asana.com/api/1.0/tasks/{tgid}', params={'opt_fields': opt_fields})
+        if resp_t.status_code != 200:
+            click.echo(f"Failed to fetch Asana task {tgid}: {resp_t.status_code}")
+            return
+        td = resp_t.json().get('data', {})
+        # Build TW kwargs
+        desc = td.get('name', '')
+        notes = td.get('notes', '')
+        if notes:
+            desc = f"{desc}\n\n{notes}"
+        due = td.get('due_on')
+        # Derive TW project from configured project list
+        tw_project = None
+        if 'projects' in td and td['projects']:
+            pr = td['projects'][0]
+            ws = pr.get('workspace', {}).get('name')
+            pn = pr.get('name')
+            if ws and pn:
+                tw_project = f"{ws}.{pn}"
+        if not tw_project and project_ids:
+            # fallback to first configured project
+            proj_info = session.get(f'https://app.asana.com/api/1.0/projects/{project_ids[0]}', params={'opt_fields':'name,workspace.name'})
+            if proj_info.status_code == 200:
+                pd = proj_info.json().get('data', {})
+                tw_project = f"{pd.get('workspace',{}).get('name')}.{pd.get('name')}"
+        kwargs = {'description': desc, 'project': tw_project, 'asana_id': tgid}
+        for ak, twk in config.get('field_mappings', {}).get('asana_to_tw', {}).items():
+            if ak.startswith('custom_field.'):
+                cf_gid = ak.split('.',1)[1]
+                cfval = td.get('custom_fields', {}).get(cf_gid)
+            else:
+                cfval = td.get(ak)
+                if isinstance(cfval, dict) and 'name' in cfval:
+                    cfval = cfval.get('name')
+            if cfval is not None:
+                kwargs[twk] = cfval
+        if due:
+            kwargs['due'] = due
+        try:
+            tw.task_add(**kwargs)
+            click.echo(f"Added Asana {tgid} to TW: {kwargs.get('description','')}")
+        except Exception as e:
+            click.echo(f"Error adding task {tgid}: {e}")
+        return
+    # Bulk import for each configured project
+    for proj_gid in project_ids:
+        resp_proj = session.get(f'https://app.asana.com/api/1.0/projects/{proj_gid}', params={'opt_fields':'name,workspace.name'})
+        if resp_proj.status_code != 200:
+            click.echo(f"Failed to fetch project {proj_gid}: {resp_proj.status_code}")
+            continue
+        proj = resp_proj.json().get('data', {})
+        proj_name = proj.get('name')
+        ws_name = proj.get('workspace', {}).get('name')
+        tw_project = f"{ws_name}.{proj_name}"
+        click.echo(f"Importing tasks for project {tw_project}...")
+        resp_tasks = session.get(f'https://app.asana.com/api/1.0/projects/{proj_gid}/tasks')
+        if resp_tasks.status_code != 200:
+            click.echo(f"  Failed to list tasks for project {proj_name}: {resp_tasks.status_code}")
+            continue
+        tasks = resp_tasks.json().get('data', [])
+        for t in tasks:
+            t_gid = t.get('gid')
+            if tw.filter_tasks({'asana_id': t_gid}):
+                continue
+            resp_t = session.get(f'https://app.asana.com/api/1.0/tasks/{t_gid}', params={'opt_fields': opt_fields})
+            if resp_t.status_code != 200:
+                click.echo(f"  Failed to fetch task {t_gid}: {resp_t.status_code}")
+                continue
+            td = resp_t.json().get('data', {})
+            desc = td.get('name','')
+            notes = td.get('notes','')
+            if notes:
+                desc = f"{desc}\n\n{notes}"
+            due = td.get('due_on')
+            kwargs = {'description': desc, 'project': tw_project, 'asana_id': t_gid}
+            for ak, twk in config.get('field_mappings', {}).get('asana_to_tw', {}).items():
+                if ak.startswith('custom_field.'):
+                    cf_gid = ak.split('.',1)[1]
+                    cfval = td.get('custom_fields', {}).get(cf_gid)
+                else:
+                    cfval = td.get(ak)
+                    if isinstance(cfval, dict) and 'name' in cfval:
+                        cfval = cfval.get('name')
+                if cfval is not None:
+                    kwargs[twk] = cfval
+            if due:
+                kwargs['due'] = due
+            try:
+                tw.task_add(**kwargs)
+                click.echo(f"  Added task: {desc}")
+            except Exception as e:
+                click.echo(f"  Error adding task {t_gid}: {e}")
 
 @cli.command()
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
 @click.pass_context
-def sync(ctx, verbose):
-    """Sync tasks from Asana into Taskwarrior."""
+def sync(ctx, verbose, task_id=None):
+    """Bidirectional sync between Asana and Taskwarrior."""
+    # Delegate sync to push/pull/sync_one workflows
+    # Initialize sessions and interfaces
+    config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids = _initialize(ctx, verbose)
+    # Single-task sync
+    if task_id:
+        click.echo(f"Syncing single TaskWarrior task {task_id}...")
+        sync_one(task_id)
+        return
+    # Bulk sync: merge existing tasks
+    data = tw.load_tasks('all')
+    for lst in data.values():
+        for task in lst:
+            if task.get('asana_id'):
+                sync_one(task.get('uuid'))
+    # Push new TaskWarrior tasks to Asana
+    ctx.invoke(push)
+    # Pull new Asana tasks to TaskWarrior
+    ctx.invoke(pull)
+    return
     # If verbose from this command or global, enable detailed logging
     if verbose or ctx.obj.get('verbose'):
         logging.getLogger().setLevel(logging.DEBUG)
@@ -302,6 +592,8 @@ def sync(ctx, verbose):
     ws_list = me_data.get("workspaces", [])
     ws_name_to_gid = {w.get("name"): w.get("gid") for w in ws_list}
     ws_gid_to_name = {v: k for k, v in ws_name_to_gid.items()}
+    if task_id:
+        click.echo(f'Syncing single task id {task_id}')
     # Setup TaskWarrior
     # Initialize TaskWarrior interface
     from taskw import TaskWarrior
