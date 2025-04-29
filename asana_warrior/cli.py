@@ -450,9 +450,92 @@ def push(ctx, verbose, task_id=None):
             click.echo(f"No TaskWarrior task with uuid {task_id}")
             return
         task = tw_tasks[0]
+        # If already pushed to Asana, merge completion last-write-wins
         if task.get('asana_id'):
-            click.echo(f"TaskWarrior task {task_id} already has Asana ID {task['asana_id']}; skipping push.")
+            asana_gid = task['asana_id']
+            # Fetch Asana completion and modified timestamp
+            try:
+                resp0 = session.get(
+                    f'https://app.asana.com/api/1.0/tasks/{asana_gid}',
+                    params={'opt_fields': 'completed,modified_at'}
+                )
+                data0 = resp0.json().get('data', {}) if resp0.status_code == 200 else {}
+            except Exception:
+                data0 = {}
+            asana_mod_ts = data0.get('modified_at', '')
+            asana_mod_dt = iso_to_dt(asana_mod_ts) or datetime.fromtimestamp(0, timezone.utc)
+            completed_asana = data0.get('completed', False)
+            # Get TW completion and modified
+            completed_tw = (task.get('status') == 'completed')
+            tw_mod_ts = task.get('modified', '')
+            tw_mod_dt = iso_to_dt(tw_mod_ts) or datetime.fromtimestamp(0, timezone.utc)
+            # If status differs, apply the more recent change
+            if completed_tw != completed_asana:
+                if asana_mod_dt > tw_mod_dt:
+                    # Asana change more recent → apply to TW
+                    if completed_asana:
+                        tw.task_done(uuid=task_id)
+                    else:
+                        tw._execute(task_id, 'modify', 'status:pending')
+                    # Update sync timestamp
+                    tw._execute(task_id, 'modify', f'asana_modified_at:{asana_mod_ts}')
+                    click.echo(f"  Synced completion Asana→TW for task {task_id}")
+                    return
+                else:
+                    # TW change more recent → push to Asana
+                    click.echo(f"  Synced completion TW→Asana for task {task_id}")
+                    upayload = {'data': {'completed': completed_tw}}
+                    try:
+                        cresp = session.put(
+                            f'https://app.asana.com/api/1.0/tasks/{asana_gid}',
+                            json=upayload
+                        )
+                        cresp.raise_for_status()
+                        new_mod = cresp.json().get('data', {}).get('modified_at', '')
+                        tw._execute(task_id, 'modify', f'asana_modified_at:{new_mod}')
+                    except Exception as e:
+                        click.echo(f"  Error syncing completion to Asana {asana_gid}: {e}")
+                    return
+            # Otherwise no completion diff → proceed to export other fields
+            click.echo(f"Updating Asana task {asana_gid} from TW {task_id}...")
+            # Build update payload for name/notes/due/custom_fields
+            desc = task.get('description', '')
+            if '\n\n' in desc:
+                name, notes = desc.split('\n\n', 1)
+            else:
+                name, notes = desc, ''
+            upayload = {'data': {'name': name, 'notes': notes}}
+            # Handle due date
+            due_val = task.get('due')
+            if due_val:
+                if re.match(r'^\d{4}-\d{2}-\d{2}$', due_val):
+                    upayload['data']['due_on'] = due_val
+                else:
+                    dt_due = iso_to_dt(due_val)
+                    if dt_due:
+                        upayload['data']['due_on'] = dt_due.date().isoformat()
+            # Map additional fields
+            for twk, ak in config.get('field_mappings', {}).get('tw_to_asana', {}).items():
+                if task.get(twk) is not None:
+                    if ak.startswith('custom_field.'):
+                        _, cf_gid = ak.split('.', 1)
+                        upayload['data'].setdefault('custom_fields', {})[cf_gid] = task[twk]
+                    else:
+                        upayload['data'][ak] = task[twk]
+            # Ensure we include current completion too
+            upayload['data']['completed'] = completed_tw
+            # Send update to Asana
+            try:
+                uresp = session.put(f'https://app.asana.com/api/1.0/tasks/{asana_gid}', json=upayload)
+                uresp.raise_for_status()
+                udata = uresp.json().get('data', {})
+                new_mod = udata.get('modified_at', '')
+                tw._execute(task_id, 'modify', f'asana_modified_at:{new_mod}')
+                click.echo(f"  Updated Asana task {asana_gid}")
+            except Exception as e:
+                click.echo(f"  Failed updating Asana task {asana_gid}: {e}")
             return
+        # End existing Asana merge, now treat as new task
         export_tasks = [task]
     else:
         # All tasks without an Asana ID
@@ -926,44 +1009,42 @@ def sync(ctx, verbose, task_id=None):
             click.echo(f"Failed to fetch Asana task {asana_gid}: {aresp.status_code}")
             continue
         adata = aresp.json().get('data', {})
-        # Sync completion status
-        completed_tw = (task.get('status') == 'completed')
-        completed_asana = adata.get('completed', False)
-        if completed_tw and not completed_asana:
-            # Mark Asana task complete
-            try:
-                cresp = session.put(
-                    f"https://app.asana.com/api/1.0/tasks/{asana_gid}",
-                    json={'data': {'completed': True}}
-                )
-                cresp.raise_for_status()
-                new_mod = cresp.json().get('data', {},).get('modified_at', '')
-                # Update only the asana_modified_at UDA without touching annotations
-                tw._execute(
-                    tw_uuid,
-                    'modify',
-                    f'asana_modified_at:{new_mod}'
-                )
-                click.echo(f"  Marked Asana task {asana_gid} complete for TW {tw_uuid}")
-            except Exception as e:
-                click.echo(f"  Failed to mark Asana task complete: {e}")
-            continue
-        elif completed_asana and task.get('status') != 'completed':
-            # Mark TW task done
-            try:
-                tw.task_done(uuid=task.get('uuid'))
-                # Update only the asana_modified_at UDA without removing annotations
-                tw._execute(
-                    tw_uuid,
-                    'modify',
-                    f'asana_modified_at:{adata.get("modified_at", "")}'
-                )
-                click.echo(f"  Marked TW task {tw_uuid} done from Asana {asana_gid}")
-            except Exception as e:
-                click.echo(f"  Failed to mark TW task done: {e}")
-            continue
+        # Sync completion/incompletion based on last-write-wins
         asana_mod_ts = adata.get('modified_at', '')
         asana_mod_dt = iso_to_dt(asana_mod_ts) or datetime.fromtimestamp(0, timezone.utc)
+        completed_tw = (task.get('status') == 'completed')
+        completed_asana = adata.get('completed', False)
+        if completed_tw != completed_asana:
+            # Determine which side changed last
+            if tw_mod_dt > asana_mod_dt:
+                # Push TW completion state to Asana
+                try:
+                    cresp = session.put(
+                        f"https://app.asana.com/api/1.0/tasks/{asana_gid}",
+                        json={'data': {'completed': completed_tw}}
+                    )
+                    cresp.raise_for_status()
+                    new_mod = cresp.json().get('data', {}).get('modified_at', '')
+                    tw._execute(tw_uuid, 'modify', f'asana_modified_at:{new_mod}')
+                    click.echo(f"  Synced completion TW->Asana for task {tw_uuid}")
+                except Exception as e:
+                    click.echo(f"  Error syncing completion to Asana {asana_gid}: {e}")
+            else:
+                # Apply Asana completion state to TW
+                try:
+                    if completed_asana:
+                        tw.task_done(uuid=tw_uuid)
+                    else:
+                        tw._execute(tw_uuid, 'modify', 'status:pending')
+                except Exception:
+                    pass
+                try:
+                    tw._execute(tw_uuid, 'modify', f'asana_modified_at:{asana_mod_ts}')
+                    click.echo(f"  Synced completion Asana->TW for task {tw_uuid}")
+                except Exception as e:
+                    click.echo(f"  Error syncing completion to TW {tw_uuid}: {e}")
+            continue
+        # End completion sync
         # Determine sync direction
         # TW->Asana if TW changed since last sync and at least as recent as Asana
         if tw_mod_dt > last_sync_dt and tw_mod_dt >= asana_mod_dt:
@@ -1276,8 +1357,8 @@ def install_hook(ctx, verbose):
     # Hook events: run on task add and on exit to trigger Asana sync
     events = ['add', 'exit']
 
-    # Resolve executable
-    exe = shutil.which('asana-warrior') or shutil.which('aw')
+    # Resolve executable (support install under any alias)
+    exe = shutil.which('asana-warrior') or shutil.which('aw') or shutil.which('awarrior')
     if not exe:
         click.echo("WARNING: 'asana-warrior' not found in PATH; using fallback executable path.")
         exe = os.path.realpath(sys.argv[0])

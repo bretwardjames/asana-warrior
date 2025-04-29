@@ -78,6 +78,10 @@ The goal is to **aggregate tasks across platforms**, allowing individuals to use
    ```bash
    pip install -e .
    ```
+   This will install three command aliases for the CLI:
+   - aw
+   - awarrior
+   - asana-warrior
 4. Run configuration:
    ```bash
    asana-warrior configure
