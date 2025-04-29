@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
   
 # -- Helpers ------------------------------------------------------------------
 def _initialize(ctx, verbose_flag):
-    """Load config, set up logging, Asana session, TaskWarrior and workspace maps."""
+    """Load config, set up logging, Asana session, TaskWarrior, workspace maps, and current user gid."""
     # Configure logging if requested
     if verbose_flag or ctx.obj.get('verbose'):
         logging.getLogger().setLevel(logging.DEBUG)
@@ -53,12 +53,14 @@ def _initialize(ctx, verbose_flag):
     ws_list = me_data.get('workspaces', [])
     ws_name_to_gid = {w.get('name'): w.get('gid') for w in ws_list}
     ws_gid_to_name = {v: k for k, v in ws_name_to_gid.items()}
+    # Current user gid
+    me_gid = me_data.get('gid')
     # Setup TaskWarrior interface
     from taskw import TaskWarrior
     tw = TaskWarrior()
     # Configured Asana project IDs for pull
     project_ids = config.get('projects', [])
-    return config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids
+    return config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids, me_gid
 
 
 # Helper to parse various ISO8601 timestamps (Asana & Taskwarrior)
@@ -82,10 +84,112 @@ def iso_to_dt(ts):
         pass
     return None
 
+# -- Annotation Sync Helper --------------------------------------------------
+def _sync_annotations_for_task(session, tw, task, me_gid):
+    """Import Asana comments into TW annotations and push new TW annotations to Asana for one task."""
+    tw_uuid = task.get('uuid')
+    asana_gid = task.get('asana_id')
+    if not asana_gid:
+        return
+    # Import Asana comments → TW annotations
+    # Gather already-imported GIDs and local texts
+    imported = set()
+    existing = []
+    for ann in task.get('annotations', []):
+        desc = ann.get('description', '') or ''
+        m = re.search(r'\[[^:]+:(\d+)', desc)
+        if m:
+            imported.add(m.group(1))
+        else:
+            existing.append(desc.strip())
+    # Fetch Asana stories
+    try:
+        resp = session.get(
+            f'https://app.asana.com/api/1.0/tasks/{asana_gid}/stories',
+            params={'opt_fields': 'gid,type,text,created_by.gid,created_by.name,created_at'}
+        )
+    except Exception:
+        resp = None
+    if not resp or resp.status_code != 200:
+        return
+    for story in resp.json().get('data', []):
+        if story.get('type') != 'comment':
+            continue
+        s_gid = story.get('gid')
+        text = story.get('text', '').strip()
+        if not text or s_gid in imported or text in existing:
+            continue
+        author = story.get('created_by', {}) or {}
+        display = 'me' if author.get('gid') == me_gid else author.get('name', '')
+        created = story.get('created_at', '')
+        note = f'[{display}:{s_gid} @ {created}] {text}'
+        try:
+            tw.task_annotate(task, note)
+        except Exception:
+            continue
+    # Push new TW annotations → Asana comments
+    # Refresh task annotations
+    try:
+        tdata = tw.filter_tasks({'uuid': tw_uuid})
+        task2 = tdata[0]
+    except Exception:
+        return
+    # Fetch existing Asana comment texts
+    try:
+        resp2 = session.get(
+            f'https://app.asana.com/api/1.0/tasks/{asana_gid}/stories',
+            params={'opt_fields': 'type,text'}
+        )
+        stories = resp2.json().get('data', []) if resp2.status_code == 200 else []
+    except Exception:
+        stories = []
+    existing_texts = {s.get('text','') for s in stories if s.get('type') == 'comment'}
+    # Export annotations once before loop
+    try:
+        raw = subprocess.check_output(['task', 'rc.hooks=off', f'uuid:{tw_uuid}', 'export'])
+        arr = json.loads(raw)
+        exported_annots = {a.get('description', '').strip() for a in arr[0].get('annotations', [])}
+    except Exception:
+        exported_annots = set()
+
+    for ann in task2.get('annotations', []):
+        desc = ann.get('description', '').strip()
+        # Skip markers or empty
+        if re.match(r'^\[[^:]+:\d+ @ .*?\]', desc) or not desc or desc in existing_texts:
+            continue
+
+        # Post to Asana
+        try:
+            post = session.post(
+                f'https://app.asana.com/api/1.0/tasks/{asana_gid}/stories',
+                json={'data': {'text': desc}}
+            )
+        except Exception:
+            continue
+        if post.status_code >= 400:
+            continue
+
+        nd = post.json().get('data', {})
+        new_gid = nd.get('gid')
+        created = nd.get('created_at', '')
+        marker = f'[me:{new_gid} @ {created}] {desc}'
+
+        # Denotate original
+        if desc in exported_annots:
+            try:
+                tw._execute(tw_uuid, 'denotate', desc)
+            except Exception:
+                pass
+
+        # Add marker
+        try:
+            tw.task_annotate(task, marker)
+        except Exception:
+            pass
+
 
 @click.group()
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
-@click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
 @click.pass_context
 def cli(ctx, verbose):
     """Asana ↔ Taskwarrior sync utility."""
@@ -322,22 +426,34 @@ def sync_one(task_id):
         return
     # Perform pull (Asana -> TW) for this Asana ID
     ctx.invoke(pull, task_id=asana_id)
+    # Sync annotations for this task
+    # Re-initialize session and TaskWarrior to get context
+    config, session, tw2, _, _, _, me_gid = _initialize(ctx, ctx.obj.get('verbose', False))
+    try:
+        task2 = tw2.filter_tasks({'uuid': task_id})[0]
+        _sync_annotations_for_task(session, tw2, task2, me_gid)
+    except Exception:
+        pass
 
-@click.command()
+@cli.command()
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
 @click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
-@click.pass_context()
+@click.pass_context
 def push(ctx, verbose, task_id=None):
     """Push tasks from Taskwarrior to Asana. Optional `task_id` to push one task only."""
     # Initialize Asana session and TaskWarrior
-    config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids = _initialize(ctx, verbose)
-    # Determine tasks to export
+    config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids, me_gid = _initialize(ctx, verbose)
+    # Determine tasks to export (only tasks without existing Asana ID)
     if task_id:
         tw_tasks = tw.filter_tasks({'uuid': task_id})
         if not tw_tasks:
             click.echo(f"No TaskWarrior task with uuid {task_id}")
             return
-        export_tasks = tw_tasks
+        task = tw_tasks[0]
+        if task.get('asana_id'):
+            click.echo(f"TaskWarrior task {task_id} already has Asana ID {task['asana_id']}; skipping push.")
+            return
+        export_tasks = [task]
     else:
         # All tasks without an Asana ID
         data = tw.load_tasks('all')
@@ -417,14 +533,14 @@ def push(ctx, verbose, task_id=None):
         except Exception as e:
             click.echo(f"  Failed updating TW {tw_uuid}: {e}")
 
-@click.command()
+@cli.command()
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
 @click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
-@click.pass_context()
+@click.pass_context
 def pull(ctx, verbose, task_id=None):
     """Pull tasks from Asana to Taskwarrior. Optional `task_id` to pull one task only."""
     # Initialize Asana session and TaskWarrior
-    config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids = _initialize(ctx, verbose)
+    config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids, me_gid = _initialize(ctx, verbose)
     # Determine Asana->TW field mappings
     base_fields = {'name', 'notes', 'due_on'}
     for ak in config.get('field_mappings', {}).get('asana_to_tw', {}):
@@ -435,11 +551,12 @@ def pull(ctx, verbose, task_id=None):
     opt_fields = ','.join(sorted(base_fields))
     # Single task pull
     if task_id:
-        gids = [task_id]
-    else:
-        gids = project_ids
-    # If pulling a specific Asana task
-    if task_id:
+        # Skip if already imported into TaskWarrior
+        existing = tw.filter_tasks({'asana_id': task_id})
+        if existing:
+            click.echo(f"TaskWarrior already contains Asana task {task_id}; skipping pull.")
+            return
+        # Fetch single task details
         tgid = task_id
         resp_t = session.get(f'https://app.asana.com/api/1.0/tasks/{tgid}', params={'opt_fields': opt_fields})
         if resp_t.status_code != 200:
@@ -542,7 +659,7 @@ def sync(ctx, verbose, task_id=None):
     """Bidirectional sync between Asana and Taskwarrior."""
     # Delegate sync to push/pull/sync_one workflows
     # Initialize sessions and interfaces
-    config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids = _initialize(ctx, verbose)
+    config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids, me_gid = _initialize(ctx, verbose)
     # Single-task sync
     if task_id:
         click.echo(f"Syncing single TaskWarrior task {task_id}...")
