@@ -26,8 +26,9 @@ The goal is to **aggregate tasks across platforms**, allowing individuals to use
   - **Taskwarrior → Asana**:
     - New annotations in Taskwarrior (for synced tasks) are posted to Asana as comments.
 
-- **Selective Syncing**:
-  - Only tasks with an **`asana_id`** (imported from Asana) or a **specific sync flag** (e.g., tag or project) are synced.
+ - **Selective Syncing**:
+   - Only tasks with an **`asana_id`** (imported from Asana) or a **specific sync flag** (e.g., tag or project) are synced.
+   - When importing tasks from Asana (project sync), only tasks **assigned to the authenticated user** will be fetched.
 
 ---
 

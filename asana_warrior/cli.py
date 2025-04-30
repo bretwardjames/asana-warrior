@@ -113,7 +113,8 @@ def _sync_annotations_for_task(session, tw, task, me_gid):
     if not resp or resp.status_code != 200:
         return
     for story in resp.json().get('data', []):
-        if story.get('type') != 'comment':
+        # Only user comments (skip system comments)
+        if story.get('type') != 'comment' or not story.get('created_by', {}).get('gid'):
             continue
         s_gid = story.get('gid')
         text = story.get('text', '').strip()
@@ -134,23 +135,17 @@ def _sync_annotations_for_task(session, tw, task, me_gid):
         task2 = tdata[0]
     except Exception:
         return
-    # Fetch existing Asana comment texts
-    try:
-        resp2 = session.get(
-            f'https://app.asana.com/api/1.0/tasks/{asana_gid}/stories',
-            params={'opt_fields': 'type,text'}
-        )
-        stories = resp2.json().get('data', []) if resp2.status_code == 200 else []
-    except Exception:
-        stories = []
-    existing_texts = {s.get('text','') for s in stories if s.get('type') == 'comment'}
-    # Export annotations once before loop
-    try:
-        raw = subprocess.check_output(['task', 'rc.hooks=off', f'uuid:{tw_uuid}', 'export'])
-        arr = json.loads(raw)
-        exported_annots = {a.get('description', '').strip() for a in arr[0].get('annotations', [])}
-    except Exception:
-        exported_annots = set()
+    # Gather Asana comment texts (user comments only) and existing TW annotations before export
+    stories_data = resp.json().get('data', [])
+    existing_texts = {
+        s.get('text', '') for s in stories_data
+        if s.get('type') == 'comment' and s.get('created_by', {}).get('gid')
+    }
+    # Capture TW annotations present before pushing new ones
+    exported_annots = {
+        a.get('description', '').strip()
+        for a in task2.get('annotations', [])
+    }
 
     for ann in task2.get('annotations', []):
         desc = ann.get('description', '').strip()
@@ -671,10 +666,15 @@ def pull(ctx, verbose, task_id=None):
             if ak.startswith('custom_field.'):
                 cf_gid = ak.split('.',1)[1]
                 cfval = td.get('custom_fields', {}).get(cf_gid)
+                if isinstance(cfval, dict) and 'gid' in cfval:
+                    cfval = cfval.get('gid')
             else:
                 cfval = td.get(ak)
-                if isinstance(cfval, dict) and 'name' in cfval:
-                    cfval = cfval.get('name')
+                if isinstance(cfval, dict):
+                    if ak == 'assignee' and 'gid' in cfval:
+                        cfval = cfval.get('gid')
+                    elif 'name' in cfval:
+                        cfval = cfval.get('name')
             if cfval is not None:
                 kwargs[twk] = cfval
         if due:
@@ -695,10 +695,18 @@ def pull(ctx, verbose, task_id=None):
         proj_name = proj.get('name')
         ws_name = proj.get('workspace', {}).get('name')
         tw_project = f"{ws_name}.{proj_name}"
-        click.echo(f"Importing tasks for project {tw_project}...")
-        resp_tasks = session.get(f'https://app.asana.com/api/1.0/projects/{proj_gid}/tasks')
+        click.echo(f"Importing tasks for project {tw_project} (assigned to current user)...")
+        # Fetch only tasks in the project assigned to the authorized user
+        resp_tasks = session.get(
+            f'https://app.asana.com/api/1.0/tasks',
+            params={
+                'assignee': me_gid,
+                'completed_since': 'now',
+                'workspace': proj.get('workspace', {}).get('gid')
+            }
+        )
         if resp_tasks.status_code != 200:
-            click.echo(f"  Failed to list tasks for project {proj_name}: {resp_tasks.status_code}")
+            click.echo(f"  Failed to list tasks for project {proj_name}: {resp_tasks.status_code} - {resp_tasks.text}")
             continue
         tasks = resp_tasks.json().get('data', [])
         for t in tasks:
@@ -720,10 +728,15 @@ def pull(ctx, verbose, task_id=None):
                 if ak.startswith('custom_field.'):
                     cf_gid = ak.split('.',1)[1]
                     cfval = td.get('custom_fields', {}).get(cf_gid)
+                    if isinstance(cfval, dict) and 'gid' in cfval:
+                        cfval = cfval.get('gid')
                 else:
                     cfval = td.get(ak)
-                    if isinstance(cfval, dict) and 'name' in cfval:
-                        cfval = cfval.get('name')
+                    if isinstance(cfval, dict):
+                        if ak == 'assignee' and 'gid' in cfval:
+                            cfval = cfval.get('gid')
+                        elif 'name' in cfval:
+                            cfval = cfval.get('name')
                 if cfval is not None:
                     kwargs[twk] = cfval
             if due:
@@ -817,7 +830,7 @@ def sync(ctx, verbose, task_id=None):
         proj_name = proj.get("name")
         ws_name = proj.get("workspace", {}).get("name")
         tw_project = f"{ws_name}.{proj_name}"
-        click.echo(f"Importing tasks for project {tw_project}...")
+        click.echo(f"Importing tasks for project {tw_project} (gid: {proj_gid})...")
         # List tasks in project
         resp_tasks = session.get(
             f"https://app.asana.com/api/1.0/projects/{proj_gid}/tasks"
@@ -861,11 +874,16 @@ def sync(ctx, verbose, task_id=None):
                 if ak.startswith('custom_field.'):
                     cf_gid = ak.split('.',1)[1]
                     cfval = td.get('custom_fields',{}).get(cf_gid)
+                    if isinstance(cfval, dict) and 'gid' in cfval:
+                        cfval = cfval.get('gid')
                 else:
                     cfval = td.get(ak)
-                    # If Asana returns an object (e.g. assignee), extract its name
-                    if isinstance(cfval, dict) and 'name' in cfval:
-                        cfval = cfval.get('name')
+                    # If Asana returns an object (e.g. assignee), extract its ID or name
+                    if isinstance(cfval, dict):
+                        if ak == 'assignee' and 'gid' in cfval:
+                            cfval = cfval.get('gid')
+                        elif 'name' in cfval:
+                            cfval = cfval.get('name')
                 if cfval is not None:
                     kwargs[twk] = cfval
             if due:
