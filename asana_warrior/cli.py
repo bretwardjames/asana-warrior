@@ -685,6 +685,8 @@ def pull(ctx, verbose, task_id=None):
         except Exception as e:
             click.echo(f"Error adding task {tgid}: {e}")
         return
+    # Bulk import for each configured project, using last_pulled to limit updates
+    last_pulled = config.get('last_pulled')
     # Bulk import for each configured project
     for proj_gid in project_ids:
         resp_proj = session.get(f'https://app.asana.com/api/1.0/projects/{proj_gid}', params={'opt_fields':'name,workspace.name'})
@@ -696,19 +698,33 @@ def pull(ctx, verbose, task_id=None):
         ws_name = proj.get('workspace', {}).get('name')
         tw_project = f"{ws_name}.{proj_name}"
         click.echo(f"Importing tasks for project {tw_project} (assigned to current user)...")
-        # Fetch only tasks in the project assigned to the authorized user
-        resp_tasks = session.get(
-            f'https://app.asana.com/api/1.0/tasks',
-            params={
-                'assignee': me_gid,
-                'completed_since': 'now',
-                'workspace': proj.get('workspace', {}).get('gid')
-            }
-        )
+        # Fetch tasks in the project assigned to the authorized user, modified since last pull
+        ws_gid = proj.get('workspace', {}).get('gid')
+        params = {
+            'assignee': me_gid,
+            'completed_since': 'now',
+            'workspace': ws_gid
+        }
+        if last_pulled:
+            params['modified_since'] = last_pulled
+        tasks = []
+        # initial page fetch
+        resp_tasks = session.get('https://app.asana.com/api/1.0/tasks', params=params)
         if resp_tasks.status_code != 200:
             click.echo(f"  Failed to list tasks for project {proj_name}: {resp_tasks.status_code} - {resp_tasks.text}")
             continue
-        tasks = resp_tasks.json().get('data', [])
+        data = resp_tasks.json()
+        tasks.extend(data.get('data', []))
+        # pagination for additional pages
+        next_page = data.get('next_page') or {}
+        while next_page.get('offset'):
+            params['offset'] = next_page['offset']
+            resp_tasks = session.get('https://app.asana.com/api/1.0/tasks', params=params)
+            if resp_tasks.status_code != 200:
+                break
+            data = resp_tasks.json()
+            tasks.extend(data.get('data', []))
+            next_page = data.get('next_page') or {}
         for t in tasks:
             t_gid = t.get('gid')
             if tw.filter_tasks({'asana_id': t_gid}):
