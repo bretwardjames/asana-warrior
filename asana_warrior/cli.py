@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import shutil
 import sys
 import webbrowser
@@ -9,7 +10,10 @@ from urllib.parse import urlparse, parse_qs
 
 import click
 import requests
-from requests_oauthlib import OAuth2Session
+try:
+    from requests_oauthlib import OAuth2Session
+except ImportError:
+    OAuth2Session = None
 
 from .config import load_config, save_config, get_config_path
 import logging
@@ -432,9 +436,10 @@ def sync_one(task_id):
 
 @cli.command()
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.option('-a', '--all', 'force_all', is_flag=True, help='Ignore incremental filters and process all items')
 @click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
 @click.pass_context
-def push(ctx, verbose, task_id=None):
+def push(ctx, verbose, force_all, task_id=None):
     """Push tasks from Taskwarrior to Asana. Optional `task_id` to push one task only."""
     # Initialize Asana session and TaskWarrior
     config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids, me_gid = _initialize(ctx, verbose)
@@ -491,7 +496,11 @@ def push(ctx, verbose, task_id=None):
                     except Exception as e:
                         click.echo(f"  Error syncing completion to Asana {asana_gid}: {e}")
                     return
-            # Otherwise no completion diff → proceed to export other fields
+            # Otherwise no completion diff → check which side is newer for non-status fields
+            if asana_mod_dt > tw_mod_dt:
+                click.echo(f"  Skipping push; Asana has newer changes than TW for task {task_id}")
+                return
+            # TW changes are as new or newer → proceed to export other fields
             click.echo(f"Updating Asana task {asana_gid} from TW {task_id}...")
             # Build update payload for name/notes/due/custom_fields
             desc = task.get('description', '')
@@ -553,7 +562,7 @@ def push(ctx, verbose, task_id=None):
         if not ws_id:
             click.echo(f"  Unknown workspace '{ws_name}' for task {tw_uuid}")
             continue
-        # Ensure Asana project exists
+        # Ensure Asana project exists; skip task if not found
         resp_pl = session.get(f'https://app.asana.com/api/1.0/projects?workspace={ws_id}&archived=false')
         if resp_pl.status_code != 200:
             click.echo(f"  Failed to list Asana projects for workspace '{ws_name}'")
@@ -562,15 +571,8 @@ def push(ctx, verbose, task_id=None):
         if proj_name in proj_map:
             target_gid = proj_map[proj_name]
         else:
-            payload = {'data': {'workspace': ws_id, 'name': proj_name}}
-            cresp = session.post('https://app.asana.com/api/1.0/projects', json=payload)
-            if cresp.status_code >= 400:
-                click.echo(f"  Failed to create Asana project '{proj_name}': {cresp.status_code}")
-                continue
-            target_gid = cresp.json().get('data', {}).get('gid')
-            click.echo(f"  Created Asana project '{proj_name}' (gid: {target_gid})")
-            config.setdefault('projects', []).append(target_gid)
-            save_config(config)
+            click.echo(f"  Skipping TW {tw_uuid}: Asana project '{proj_name}' not found in workspace '{ws_name}'")
+            continue
         # Build task payload
         desc = task.get('description', '')
         if '\n\n' in desc:
@@ -613,56 +615,288 @@ def push(ctx, verbose, task_id=None):
 
 @cli.command()
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.option('-a', '--all', 'force_all', is_flag=True, help='Ignore incremental filters and process all items')
 @click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
 @click.pass_context
-def pull(ctx, verbose, task_id=None):
+def pull(ctx, verbose, force_all, task_id=None):
     """Pull tasks from Asana to Taskwarrior. Optional `task_id` to pull one task only."""
     # Initialize Asana session and TaskWarrior
     config, session, tw, ws_name_to_gid, ws_gid_to_name, project_ids, me_gid = _initialize(ctx, verbose)
     # Determine Asana->TW field mappings
     base_fields = {'name', 'notes', 'due_on'}
+    # Include project membership for filtering
+    base_fields.add('projects')
     for ak in config.get('field_mappings', {}).get('asana_to_tw', {}):
         if ak.startswith('custom_field.'):
             base_fields.add('custom_fields')
         else:
             base_fields.add(ak)
     opt_fields = ','.join(sorted(base_fields))
-    # Single task pull
+    # Ensure default Asana→TW mappings and UDA for long_desc
+    atot = config.setdefault('field_mappings', {}).setdefault('asana_to_tw', {})
+    # Default mappings: name→description, notes→long_desc, due_on→due
+    if 'name' not in atot:
+        atot['name'] = 'description'
+    if 'notes' not in atot:
+        atot['notes'] = 'long_desc'
+    if 'due_on' not in atot:
+        atot['due_on'] = 'due'
+    # Persist mapping defaults
+    save_config(config)
+    # Ensure 'long_desc' UDA exists
+    try:
+        udas = tw.config.get_udas().keys()
+    except Exception:
+        udas = []
+    if 'long_desc' not in udas:
+        tw._execute('config', 'uda.long_desc.type', 'string')
+        tw._execute('config', 'uda.long_desc.label', 'Long description')
+
+    # Single-task pull: import new or update existing TaskWarrior entry
     if task_id:
-        # Skip if already imported into TaskWarrior
-        existing = tw.filter_tasks({'asana_id': task_id})
-        if existing:
-            click.echo(f"TaskWarrior already contains Asana task {task_id}; skipping pull.")
-            return
-        # Fetch single task details
         tgid = task_id
+        # Fetch full Asana task details
         resp_t = session.get(f'https://app.asana.com/api/1.0/tasks/{tgid}', params={'opt_fields': opt_fields})
         if resp_t.status_code != 200:
             click.echo(f"Failed to fetch Asana task {tgid}: {resp_t.status_code}")
             return
         td = resp_t.json().get('data', {})
-        # Build TW kwargs
-        desc = td.get('name', '')
-        notes = td.get('notes', '')
-        if notes:
-            desc = f"{desc}\n\n{notes}"
-        due = td.get('due_on')
-        # Derive TW project from configured project list
+        # Determine TW project
         tw_project = None
-        if 'projects' in td and td['projects']:
+        if td.get('projects'):
             pr = td['projects'][0]
             ws = pr.get('workspace', {}).get('name')
             pn = pr.get('name')
             if ws and pn:
                 tw_project = f"{ws}.{pn}"
         if not tw_project and project_ids:
-            # fallback to first configured project
-            proj_info = session.get(f'https://app.asana.com/api/1.0/projects/{project_ids[0]}', params={'opt_fields':'name,workspace.name'})
+            proj_info = session.get(
+                f'https://app.asana.com/api/1.0/projects/{project_ids[0]}',
+                params={'opt_fields': 'name,workspace.name'}
+            )
             if proj_info.status_code == 200:
                 pd = proj_info.json().get('data', {})
-                tw_project = f"{pd.get('workspace',{}).get('name')}.{pd.get('name')}"
-        kwargs = {'description': desc, 'project': tw_project, 'asana_id': tgid}
-        for ak, twk in config.get('field_mappings', {}).get('asana_to_tw', {}).items():
+                tw_project = f"{pd.get('workspace', {}).get('name')}.{pd.get('name')}"
+        mapping = config.get('field_mappings', {}).get('asana_to_tw', {})
+        # Check if TW already has this task
+        existing = tw.filter_tasks({'asana_id': tgid})
+        if existing:
+            task_tw = existing[0]
+            # Update fields if changed in Asana
+            for ak, twk in mapping.items():
+                # Extract Asana field value
+                if ak.startswith('custom_field.'):
+                    cf_gid = ak.split('.', 1)[1]
+                    cfval = td.get('custom_fields', {}).get(cf_gid)
+                    if isinstance(cfval, dict) and 'gid' in cfval:
+                        cfval = cfval.get('gid')
+                else:
+                    cfval = td.get(ak)
+                    if isinstance(cfval, dict):
+                        if ak == 'assignee' and 'gid' in cfval:
+                            cfval = cfval.get('gid')
+                        elif 'name' in cfval:
+                            cfval = cfval.get('name')
+                # Normalize HTML and entities
+                if isinstance(cfval, str):
+                    cfval = html.unescape(cfval)
+                    if ak == 'html_notes':
+                        cfval = cfval.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
+                        cfval = re.sub(r'<[^>]+>', '', cfval)
+                # Compare and modify if different
+                if cfval is not None and cfval != task_tw.get(twk):
+                    try:
+                        tw._execute(task_tw.get('uuid'), 'modify', f'{twk}:{cfval}')
+                    except Exception:
+                        pass
+            click.echo(f"  Updated TW {task_tw.get('uuid')} from Asana {tgid}")
+        else:
+            # Add new TW task
+            kwargs = {'project': tw_project, 'asana_id': tgid}
+            for ak, twk in mapping.items():
+                if ak.startswith('custom_field.'):
+                    cf_gid = ak.split('.', 1)[1]
+                    cfval = td.get('custom_fields', {}).get(cf_gid)
+                    if isinstance(cfval, dict) and 'gid' in cfval:
+                        cfval = cfval.get('gid')
+                else:
+                    cfval = td.get(ak)
+                    if isinstance(cfval, dict):
+                        if ak == 'assignee' and 'gid' in cfval:
+                            cfval = cfval.get('gid')
+                        elif 'name' in cfval:
+                            cfval = cfval.get('name')
+                # Normalize HTML and entities
+                if isinstance(cfval, str):
+                    cfval = html.unescape(cfval)
+                    if ak == 'html_notes':
+                        cfval = cfval.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
+                        cfval = re.sub(r'<[^>]+>', '', cfval)
+                if cfval is not None:
+                    kwargs[twk] = cfval
+            try:
+                tw.task_add(**kwargs)
+                click.echo(f"  Added TW {kwargs.get('description','')} from Asana {tgid}")
+            except Exception as e:
+                click.echo(f"  Error adding task {tgid}: {e}")
+        return
+    
+    # Bulk import for multiple projects
+    # If --all is set, ignore last_pulled
+    last_pulled = None if force_all else config.get('last_pulled')
+    
+    # First, gather information about all configured projects
+    project_info = {}
+    workspaces = set()
+    
+    click.echo("Gathering information about configured projects...")
+    for proj_gid in project_ids:
+        resp_proj = session.get(
+            f'https://app.asana.com/api/1.0/projects/{proj_gid}', 
+            params={'opt_fields':'name,workspace.gid,workspace.name'}
+        )
+        if resp_proj.status_code != 200:
+            click.echo(f"Failed to fetch project {proj_gid}: {resp_proj.status_code}")
+            continue
+            
+        proj = resp_proj.json().get('data', {})
+        proj_name = proj.get('name')
+        ws_data = proj.get('workspace', {})
+        ws_gid = ws_data.get('gid')
+        ws_name = ws_data.get('name')
+        
+        if not all([proj_name, ws_gid, ws_name]):
+            click.echo(f"Incomplete project data for {proj_gid}, skipping")
+            continue
+            
+        project_info[proj_gid] = {
+            'name': proj_name,
+            'workspace': {
+                'gid': ws_gid,
+                'name': ws_name
+            },
+            'tw_project': f"{ws_name}.{proj_name}"
+        }
+        workspaces.add(ws_gid)
+        
+    if not project_info:
+        click.echo("No valid projects found to sync. Please check your configuration.")
+        return
+        
+    # Now fetch all tasks for each workspace in bulk
+    all_tasks = []
+    
+    for ws_gid in workspaces:
+        click.echo(f"Fetching all tasks assigned to you in workspace {ws_gid_to_name.get(ws_gid, ws_gid)}...")
+        
+        params = {
+            'assignee': me_gid,
+            'completed_since': 'now',
+            'workspace': ws_gid
+        }
+        if last_pulled:
+            params['modified_since'] = last_pulled
+            
+        workspace_tasks = []
+        # Initial page fetch
+        resp_tasks = session.get('https://app.asana.com/api/1.0/tasks', params=params)
+        if resp_tasks.status_code != 200:
+            click.echo(f"  Failed to list tasks for workspace {ws_gid}: {resp_tasks.status_code} - {resp_tasks.text}")
+            continue
+            
+        data = resp_tasks.json()
+        workspace_tasks.extend(data.get('data', []))
+        
+        # Pagination for additional pages
+        next_page = data.get('next_page') or {}
+        while next_page.get('offset'):
+            params['offset'] = next_page['offset']
+            resp_tasks = session.get('https://app.asana.com/api/1.0/tasks', params=params)
+            if resp_tasks.status_code != 200:
+                break
+            data = resp_tasks.json()
+            workspace_tasks.extend(data.get('data', []))
+            next_page = data.get('next_page') or {}
+            
+        click.echo(f"  Found {len(workspace_tasks)} tasks in workspace {ws_gid_to_name.get(ws_gid, ws_gid)}")
+        all_tasks.extend(workspace_tasks)
+        
+    click.echo(f"Fetched a total of {len(all_tasks)} tasks across all workspaces")
+    
+    # Process all tasks, grouped by project
+    processed_count = 0
+    skipped_count = 0
+    
+    for t in all_tasks:
+        t_gid = t.get('gid')
+        # Fetch full Asana task details
+        resp_t = session.get(
+            f'https://app.asana.com/api/1.0/tasks/{t_gid}',
+            params={'opt_fields': opt_fields}
+        )
+        if resp_t.status_code != 200:
+            click.echo(f"  Failed to fetch task {t_gid}: {resp_t.status_code}")
+            continue
+            
+        td = resp_t.json().get('data', {})
+        
+        # Find if this task belongs to any of our configured projects
+        task_projects = td.get('projects') or []
+        matched_project_gid = None
+        for project in task_projects:
+            project_gid = project.get('gid')
+            if project_gid in project_info:
+                matched_project_gid = project_gid
+                break
+                
+        # Skip tasks not in any configured project
+        if not matched_project_gid:
+            skipped_count += 1
+            continue
+            
+        # Use the project info for the matched project
+        project_data = project_info[matched_project_gid]
+        tw_project = project_data['tw_project']
+        
+        mapping = config.get('field_mappings', {}).get('asana_to_tw', {})
+        
+        # Check for existing TaskWarrior entry
+        existing = tw.filter_tasks({'asana_id': t_gid})
+        if existing:
+            task_tw = existing[0]
+            # Update changed fields
+            for ak, twk in mapping.items():
+                # Extract Asana field value
+                if ak.startswith('custom_field.'):
+                    cf_gid = ak.split('.', 1)[1]
+                    cfval = td.get('custom_fields', {}).get(cf_gid)
+                    if isinstance(cfval, dict) and 'gid' in cfval:
+                        cfval = cfval.get('gid')
+                else:
+                    cfval = td.get(ak)
+                    if isinstance(cfval, dict):
+                        if ak == 'assignee' and 'gid' in cfval:
+                            cfval = cfval.get('gid')
+                        elif 'name' in cfval:
+                            cfval = cfval.get('name')
+                # Normalize HTML and entities
+                if isinstance(cfval, str):
+                    cfval = html.unescape(cfval)
+                    if ak == 'html_notes':
+                        cfval = cfval.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
+                        cfval = re.sub(r'<[^>]+>', '', cfval)
+                if cfval is not None and cfval != task_tw.get(twk):
+                    try:
+                        tw._execute(task_tw.get('uuid'), 'modify', f'{twk}:{cfval}')
+                    except Exception:
+                        pass
+            click.echo(f"  Updated TW {task_tw.get('uuid')} from Asana {t_gid} in project {project_data['name']}")
+            processed_count += 1
+            continue
+            
+        # Create new TaskWarrior task
+        kwargs = {'project': tw_project, 'asana_id': t_gid}
+        for ak, twk in mapping.items():
             if ak.startswith('custom_field.'):
                 cf_gid = ak.split('.',1)[1]
                 cfval = td.get('custom_fields', {}).get(cf_gid)
@@ -675,99 +909,33 @@ def pull(ctx, verbose, task_id=None):
                         cfval = cfval.get('gid')
                     elif 'name' in cfval:
                         cfval = cfval.get('name')
+            # Normalize HTML and entities
+            if isinstance(cfval, str):
+                cfval = html.unescape(cfval)
+                if ak == 'html_notes':
+                    cfval = cfval.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
+                    cfval = re.sub(r'<[^>]+>', '', cfval)
             if cfval is not None:
                 kwargs[twk] = cfval
-        if due:
-            kwargs['due'] = due
         try:
             tw.task_add(**kwargs)
-            click.echo(f"Added Asana {tgid} to TW: {kwargs.get('description','')}")
+            click.echo(f"  Added task: {kwargs.get('description','')} in project {project_data['name']}")
+            processed_count += 1
         except Exception as e:
-            click.echo(f"Error adding task {tgid}: {e}")
-        return
-    # Bulk import for each configured project, using last_pulled to limit updates
-    last_pulled = config.get('last_pulled')
-    # Bulk import for each configured project
-    for proj_gid in project_ids:
-        resp_proj = session.get(f'https://app.asana.com/api/1.0/projects/{proj_gid}', params={'opt_fields':'name,workspace.name'})
-        if resp_proj.status_code != 200:
-            click.echo(f"Failed to fetch project {proj_gid}: {resp_proj.status_code}")
-            continue
-        proj = resp_proj.json().get('data', {})
-        proj_name = proj.get('name')
-        ws_name = proj.get('workspace', {}).get('name')
-        tw_project = f"{ws_name}.{proj_name}"
-        click.echo(f"Importing tasks for project {tw_project} (assigned to current user)...")
-        # Fetch tasks in the project assigned to the authorized user, modified since last pull
-        ws_gid = proj.get('workspace', {}).get('gid')
-        params = {
-            'assignee': me_gid,
-            'completed_since': 'now',
-            'workspace': ws_gid
-        }
-        if last_pulled:
-            params['modified_since'] = last_pulled
-        tasks = []
-        # initial page fetch
-        resp_tasks = session.get('https://app.asana.com/api/1.0/tasks', params=params)
-        if resp_tasks.status_code != 200:
-            click.echo(f"  Failed to list tasks for project {proj_name}: {resp_tasks.status_code} - {resp_tasks.text}")
-            continue
-        data = resp_tasks.json()
-        tasks.extend(data.get('data', []))
-        # pagination for additional pages
-        next_page = data.get('next_page') or {}
-        while next_page.get('offset'):
-            params['offset'] = next_page['offset']
-            resp_tasks = session.get('https://app.asana.com/api/1.0/tasks', params=params)
-            if resp_tasks.status_code != 200:
-                break
-            data = resp_tasks.json()
-            tasks.extend(data.get('data', []))
-            next_page = data.get('next_page') or {}
-        for t in tasks:
-            t_gid = t.get('gid')
-            if tw.filter_tasks({'asana_id': t_gid}):
-                continue
-            resp_t = session.get(f'https://app.asana.com/api/1.0/tasks/{t_gid}', params={'opt_fields': opt_fields})
-            if resp_t.status_code != 200:
-                click.echo(f"  Failed to fetch task {t_gid}: {resp_t.status_code}")
-                continue
-            td = resp_t.json().get('data', {})
-            desc = td.get('name','')
-            notes = td.get('notes','')
-            if notes:
-                desc = f"{desc}\n\n{notes}"
-            due = td.get('due_on')
-            kwargs = {'description': desc, 'project': tw_project, 'asana_id': t_gid}
-            for ak, twk in config.get('field_mappings', {}).get('asana_to_tw', {}).items():
-                if ak.startswith('custom_field.'):
-                    cf_gid = ak.split('.',1)[1]
-                    cfval = td.get('custom_fields', {}).get(cf_gid)
-                    if isinstance(cfval, dict) and 'gid' in cfval:
-                        cfval = cfval.get('gid')
-                else:
-                    cfval = td.get(ak)
-                    if isinstance(cfval, dict):
-                        if ak == 'assignee' and 'gid' in cfval:
-                            cfval = cfval.get('gid')
-                        elif 'name' in cfval:
-                            cfval = cfval.get('name')
-                if cfval is not None:
-                    kwargs[twk] = cfval
-            if due:
-                kwargs['due'] = due
-            try:
-                tw.task_add(**kwargs)
-                click.echo(f"  Added task: {desc}")
-            except Exception as e:
-                click.echo(f"  Error adding task {t_gid}: {e}")
+            click.echo(f"  Error adding task {t_gid} to project {project_data['name']}: {e}")
+    
+    click.echo(f"Sync summary: Processed {processed_count} tasks, skipped {skipped_count} tasks not in configured projects")
+    
+    # Record pull timestamp for future incremental imports
+    config['last_pulled'] = datetime.now(timezone.utc).isoformat()
+    save_config(config)
 
 @cli.command()
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose debug output')
+@click.option('-a', '--all', 'force_all', is_flag=True, help='Ignore filters (pass --all to propagate to pull)')
 @click.option('-t', '--task-id', is_flag=False, type=str, help='Send a single task id to sync that task only.')
 @click.pass_context
-def sync(ctx, verbose, task_id=None):
+def sync(ctx, verbose, force_all, task_id=None):
     """Bidirectional sync between Asana and Taskwarrior."""
     # Delegate sync to push/pull/sync_one workflows
     # Initialize sessions and interfaces
@@ -784,9 +952,9 @@ def sync(ctx, verbose, task_id=None):
             if task.get('asana_id'):
                 sync_one(task.get('uuid'))
     # Push new TaskWarrior tasks to Asana
-    ctx.invoke(push)
+    ctx.invoke(push, verbose=verbose, force_all=force_all)
     # Pull new Asana tasks to TaskWarrior
-    ctx.invoke(pull)
+    ctx.invoke(pull, verbose=verbose, force_all=force_all)
     return
     # If verbose from this command or global, enable detailed logging
     if verbose or ctx.obj.get('verbose'):
@@ -1509,6 +1677,8 @@ def map_fields(ctx, verbose):
 
     # Built-in Asana fields (excluding name/notes, due_on, completed)
     asana_fields = {
+        'name':                      'Title',
+        'notes':                     'Description',
         'assignee':                  'Assignee',
         'assignee_status':           'Assignee status',
         'created_at':                'Created at',

@@ -1,6 +1,11 @@
 import os
 import json
-from appdirs import user_config_dir
+try:
+    from appdirs import user_config_dir
+except ImportError:
+    def user_config_dir(app_name):
+        # Fallback if appdirs is not installed
+        return os.getcwd()
 
 APP_NAME = "asana-warrior"
 
