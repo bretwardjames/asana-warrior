@@ -1553,9 +1553,9 @@ def install_hook(ctx, verbose):
     tw._execute('config', 'hooks.location', hooks_dir)
 
     # Clean and recreate hooks directory
-    shutil.rmtree(hooks_dir, ignore_errors=True)
-    os.makedirs(hooks_dir, exist_ok=True)
-    os.chmod(hooks_dir, 0o755)
+    # shutil.rmtree(hooks_dir, ignore_errors=True)
+    # os.makedirs(hooks_dir, exist_ok=True)
+    # os.chmod(hooks_dir, 0o755)
 
     # Hook events: run on task add and on exit to trigger Asana sync
     events = ['add', 'exit']
