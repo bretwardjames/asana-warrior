@@ -579,7 +579,7 @@ def push(ctx, verbose, force_all, task_id=None):
             name, notes = desc.split('\n\n', 1)
         else:
             name, notes = desc, ''
-        tpayload = {'data': {'name': name, 'notes': notes, 'projects': [target_gid]}}
+        tpayload = {'data': {'name': name, 'notes': notes, 'projects': [target_gid], 'assignee': me_gid}}
         due_val = task.get('due')
         if due_val:
             if re.match(r'^\d{4}-\d{2}-\d{2}$', due_val):
@@ -1209,6 +1209,7 @@ def sync(ctx, verbose, force_all, task_id=None):
         )
         if aresp.status_code != 200:
             click.echo(f"Failed to fetch Asana task {asana_gid}: {aresp.status_code}")
+            tw._execute(tw_uuid, 'modify', '+asana_removed')
             continue
         adata = aresp.json().get('data', {})
         # Sync completion/incompletion based on last-write-wins

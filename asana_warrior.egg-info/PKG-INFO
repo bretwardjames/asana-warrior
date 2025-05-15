@@ -1,4 +1,11 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: asana-warrior
 Version: 0.1.0
 Summary: Bidirectional sync between Asana and Taskwarrior
+Requires-Dist: click
+Requires-Dist: appdirs
+Requires-Dist: requests
+Requires-Dist: requests-oauthlib
+Requires-Dist: taskw
+Dynamic: requires-dist
+Dynamic: summary
